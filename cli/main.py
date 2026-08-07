@@ -1,3 +1,4 @@
+import contextlib
 import datetime
 import os
 import sys
@@ -20,6 +21,7 @@ from rich.table import Table
 from rich.text import Text
 
 from cli.announcements import display_announcements, fetch_announcements
+from cli.execution_panel import ExecutionTracker
 from cli.stats_handler import StatsCallbackHandler
 from cli.utils import (
     ask_anthropic_effort,
@@ -262,16 +264,26 @@ class MessageBuffer:
 message_buffer = MessageBuffer()
 
 
-def create_layout():
+def create_layout(execution_enabled: bool = False):
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
         Layout(name="main"),
         Layout(name="footer", size=3),
     )
-    layout["main"].split_column(
-        Layout(name="upper", ratio=3), Layout(name="analysis", ratio=5)
-    )
+    if execution_enabled:
+        # Split the analysis column so the execution panel gets a fixed-height
+        # strip at the bottom; analysis keeps the rest. Only allocated when
+        # execution is on so analysis-only runs keep the full-height panel.
+        layout["main"].split_column(
+            Layout(name="upper", ratio=3),
+            Layout(name="analysis", ratio=4),
+            Layout(name="execution", size=9),
+        )
+    else:
+        layout["main"].split_column(
+            Layout(name="upper", ratio=3), Layout(name="analysis", ratio=5)
+        )
     layout["upper"].split_row(
         Layout(name="progress", ratio=2), Layout(name="messages", ratio=3)
     )
@@ -285,7 +297,13 @@ def format_tokens(n):
     return str(n)
 
 
-def update_display(layout, spinner_text=None, stats_handler=None, start_time=None):
+def update_display(
+    layout,
+    spinner_text=None,
+    stats_handler=None,
+    start_time=None,
+    execution_tracker=None,
+):
     # Header with welcome message
     layout["header"].update(
         Panel(
@@ -449,6 +467,14 @@ def update_display(layout, spinner_text=None, stats_handler=None, start_time=Non
                 padding=(1, 2),
             )
         )
+
+    # Execution panel: only rendered when the layout has an "execution" slot
+    # (i.e. execution_enabled) AND a tracker was passed. Rich Layout has no
+    # __contains__, so probe via suppress(KeyError) rather than `in`;
+    # analysis-only runs (no execution slot) skip this path entirely.
+    if execution_tracker is not None:
+        with contextlib.suppress(KeyError):
+            layout["execution"].update(execution_tracker.render())
 
     # Footer with statistics
     # Agent progress - derived from agent_status dict
@@ -825,6 +851,25 @@ def display_complete_report(final_state):
             console.print(Panel("[bold]V. Portfolio Manager Decision[/bold]", border_style="green"))
             console.print(Panel(Markdown(risk["judge_decision"]), title="Portfolio Manager", border_style="blue", padding=(1, 2)))
 
+    # VI. Order Execution (only when execution was enabled for this run)
+    order = final_state.get("executed_order")
+    if order:
+        status = order.get("status", "error")
+        color = {"filled": "green", "skipped": "yellow", "error": "red"}.get(status, "white")
+        console.print(Panel("[bold]VI. Order Execution[/bold]", border_style=color))
+        lines = [f"Status: [{color}]{status}[/{color}]"]
+        if order.get("symbol"):
+            lines.append(f"Symbol: {order['symbol']}")
+        if order.get("action"):
+            lines.append(f"Action: {order['action']}")
+        if order.get("price") is not None:
+            lines.append(f"Price: {order['price']}")
+        if order.get("amount") is not None:
+            lines.append(f"Amount: {order['amount']}")
+        if order.get("reason"):
+            lines.append(f"Reason: {order['reason']}")
+        console.print(Panel("\n".join(lines), title="Broker Result", border_style="blue", padding=(1, 2)))
+
 
 def update_research_team_status(status):
     """Update status for research team members (not Trader)."""
@@ -1010,6 +1055,19 @@ def run_analysis(checkpoint: bool | None = None):
     # Create stats callback handler for tracking LLM/tool calls
     stats_handler = StatsCallbackHandler()
 
+    # Execution tracker for the order-execution panel. Only allocated (and the
+    # panel only shown) when execution_enabled is on, so analysis-only runs
+    # keep the original full-height layout with zero execution overhead.
+    execution_enabled = bool(config.get("execution_enabled"))
+    execution_tracker = (
+        ExecutionTracker(
+            enabled=True,
+            mode=config.get("execution_mode", "paper"),
+        )
+        if execution_enabled
+        else None
+    )
+
     # Normalize analyst selection to predefined order (selection is a 'set', order is fixed)
     selected_set = {analyst.value for analyst in selections["analysts"]}
     selected_analyst_keys = [a for a in ANALYST_ORDER if a in selected_set]
@@ -1079,11 +1137,23 @@ def run_analysis(checkpoint: bool | None = None):
     message_buffer.update_report_section = save_report_section_decorator(message_buffer, "update_report_section")
 
     # Now start the display layout
-    layout = create_layout()
+    layout = create_layout(execution_enabled=execution_enabled)
+
+    # Seed the execution panel with a pending state so it shows the ticker and
+    # mode immediately, rather than an empty box, while the analysis runs.
+    if execution_tracker is not None:
+        execution_tracker.set_pending(
+            selections["ticker"], selections["asset_type"]
+        )
 
     with Live(layout, refresh_per_second=4):
         # Initial display
-        update_display(layout, stats_handler=stats_handler, start_time=start_time)
+        update_display(
+            layout,
+            stats_handler=stats_handler,
+            start_time=start_time,
+            execution_tracker=execution_tracker,
+        )
 
         # Add initial messages
         message_buffer.add_message("System", f"Selected ticker: {selections['ticker']}")
@@ -1096,19 +1166,41 @@ def run_analysis(checkpoint: bool | None = None):
             "System",
             f"Selected analysts: {', '.join(analyst.value for analyst in selections['analysts'])}",
         )
-        update_display(layout, stats_handler=stats_handler, start_time=start_time)
+        if execution_tracker is not None:
+            message_buffer.add_message(
+                "System",
+                f"Execution enabled (mode={execution_tracker.mode}): "
+                f"orders will be placed after the Portfolio Manager decides.",
+            )
+        update_display(
+            layout,
+            stats_handler=stats_handler,
+            start_time=start_time,
+            execution_tracker=execution_tracker,
+        )
 
         # Update agent status to in_progress for the first analyst
         first_analyst = get_initial_analyst_node(analyst_execution_plan)
         message_buffer.update_agent_status(first_analyst, "in_progress")
         analyst_wall_time_tracker.mark_started(selected_analyst_keys[0])
-        update_display(layout, stats_handler=stats_handler, start_time=start_time)
+        update_display(
+            layout,
+            stats_handler=stats_handler,
+            start_time=start_time,
+            execution_tracker=execution_tracker,
+        )
 
         # Create spinner text
         spinner_text = (
             f"Analyzing {selections['ticker']} on {selections['analysis_date']}..."
         )
-        update_display(layout, spinner_text, stats_handler=stats_handler, start_time=start_time)
+        update_display(
+            layout,
+            spinner_text,
+            stats_handler=stats_handler,
+            start_time=start_time,
+            execution_tracker=execution_tracker,
+        )
 
         # Initialize state and get graph args with callbacks.
         # Resolve the instrument identity once here so all agents anchor to
@@ -1227,7 +1319,12 @@ def run_analysis(checkpoint: bool | None = None):
                     message_buffer.update_agent_status("Portfolio Manager", "completed")
 
             # Update the display
-            update_display(layout, stats_handler=stats_handler, start_time=start_time)
+            update_display(
+                layout,
+                stats_handler=stats_handler,
+                start_time=start_time,
+                execution_tracker=execution_tracker,
+            )
 
             trace.append(chunk)
 
@@ -1251,7 +1348,60 @@ def run_analysis(checkpoint: bool | None = None):
             if section in final_state:
                 message_buffer.update_report_section(section, final_state[section])
 
-        update_display(layout, stats_handler=stats_handler, start_time=start_time)
+        # Optional order execution: runs only when execution_enabled. The CLI
+        # drives the graph directly via .stream() (not propagate()), so the
+        # broker hook in trading_graph._execute_decision must be invoked here
+        # explicitly. The decision markdown is the PM's final output.
+        if execution_tracker is not None and final_state.get("final_trade_decision"):
+            message_buffer.add_message(
+                "System", "Executing order via broker (this may take a few seconds)..."
+            )
+            update_display(
+                layout,
+                stats_handler=stats_handler,
+                start_time=start_time,
+                execution_tracker=execution_tracker,
+            )
+            try:
+                order_result = graph._execute_decision(
+                    selections["ticker"],
+                    selections["asset_type"],
+                    final_state["final_trade_decision"],
+                )
+            except Exception as exc:
+                # _execute_decision is meant to swallow broker errors, but a
+                # bug in the wiring itself must not void the analysis run —
+                # surface it as an error status and keep going.
+                order_result = {"status": "error", "reason": f"execution crashed: {exc}"}
+            final_state["executed_order"] = order_result
+
+            # Resolve the rating the broker saw, for the panel header.
+            from tradingagents.agents.utils.rating import parse_rating
+            rating_str = parse_rating(final_state["final_trade_decision"])
+            execution_tracker.set_result(
+                selections["ticker"],
+                selections["asset_type"],
+                order_result,
+                rating=rating_str,
+            )
+            status = order_result.get("status", "error")
+            reason = order_result.get("reason", "")
+            if status == "filled":
+                msg = (
+                    f"Order FILLED: {order_result.get('action')} "
+                    f"{order_result.get('amount')} {order_result.get('symbol')} "
+                    f"@ {order_result.get('price')}"
+                )
+            else:
+                msg = f"Order {status.upper()}: {reason}"
+            message_buffer.add_message("System", msg)
+
+        update_display(
+            layout,
+            stats_handler=stats_handler,
+            start_time=start_time,
+            execution_tracker=execution_tracker,
+        )
 
     # Post-analysis prompts (outside Live context for clean interaction)
     console.print("\n[bold cyan]Analysis Complete![/bold cyan]\n")
