@@ -122,12 +122,17 @@ class CryptoBroker(BaseBroker):
             if passphrase:
                 ccxt_params["password"] = passphrase
             # Optional HTTPS proxy — needed when the exchange domain is blocked
-            # on the host network (e.g. OKX from mainland China). ccxt accepts
-            # only one of httpProxy/httpsProxy/socksProxy, so we set httpsProxy
-            # since exchange APIs are HTTPS.
-            if https_proxy:
-                ccxt_params["httpsProxy"] = https_proxy
+            # on the host network (e.g. OKX from mainland China). ccxt 4.x
+            # conflicts if both the constructor httpsProxy param and the
+            # `proxies` attribute are set (raises "conflicting proxy
+            # settings"); verified on 4.5.71 that only the `proxies`
+            # attribute actually applies, so we set ONLY that.
             self.exchange = exchange_cls(ccxt_params)
+            if https_proxy:
+                self.exchange.proxies = {
+                    "http": https_proxy,
+                    "https": https_proxy,
+                }
             # Sandbox/testnet must be enabled *before* any authenticated call.
             # Binance/OKX/Bybit all honor set_sandbox_mode(True).
             if testnet:
