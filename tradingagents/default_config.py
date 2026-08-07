@@ -46,6 +46,8 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_RUNNER_MAX_CYCLES":       "runner_max_cycles",
     "TRADINGAGENTS_RUNNER_TICKERS":          "runner_tickers",
     "TRADINGAGENTS_RUNNER_DB_PATH":          "runner_db_path",
+    "TRADINGAGENTS_RUNNER_REFLECT_EVERY_N_CYCLES": "runner_reflect_every_n_cycles",
+    "TRADINGAGENTS_RUNNER_REFLECT_MIN_AGE_HOURS":  "runner_reflect_min_age_hours",
 }
 
 
@@ -231,4 +233,12 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # SQLite path for the runner state store. None = default under
     # data_cache_dir/runner_state.db.
     "runner_db_path": None,
+    # Reflect on filled trades every N cycles (0 = never auto-reflect).
+    # Reflection pulls unreflected filled orders, fetches current prices,
+    # computes PnL, calls the LLM for a 3-5 sentence lesson, and appends it
+    # to the memory log so the next analysis run can learn from it.
+    "runner_reflect_every_n_cycles": 3,
+    # Minimum age (hours) a trade must reach before it's eligible for
+    # reflection. Prevents reflecting on a trade seconds after it fills.
+    "runner_reflect_min_age_hours": 1.0,
 })

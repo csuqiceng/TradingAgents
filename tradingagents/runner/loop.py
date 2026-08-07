@@ -270,6 +270,7 @@ class TradingLoop:
             order_status=order_status,
             equity_after=equity_after,
             error=error,
+            decision_md=decision_md,
         )
 
         return {
@@ -299,6 +300,8 @@ class TradingLoop:
             "TradingLoop starting: tickers=%s interval=%ss max_cycles=%s",
             self.tickers, self.interval, self.max_cycles or "inf",
         )
+        reflect_every = int(self.config.get("runner_reflect_every_n_cycles", 0) or 0)
+        reflect_min_age = float(self.config.get("runner_reflect_min_age_hours", 1.0) or 1.0)
         cycle_count = 0
         try:
             while True:
@@ -309,6 +312,16 @@ class TradingLoop:
                     if self.max_cycles and cycle_count >= self.max_cycles:
                         logger.info("max_cycles=%d reached, stopping", self.max_cycles)
                         return
+
+                # Periodically reflect on filled trades: pull unreflected
+                # orders, compute PnL, call the LLM for lessons, and append
+                # to the memory log so the next cycle learns from them.
+                if reflect_every and cycle_count % reflect_every == 0:
+                    logger.info("auto-reflecting on trades (cycle %d)", cycle_count)
+                    try:
+                        self.reflect_on_trades(min_age_hours=reflect_min_age)
+                    except Exception as exc:
+                        logger.error("auto-reflection failed: %s", exc)
 
                 if self.max_cycles and cycle_count >= self.max_cycles:
                     return
@@ -341,4 +354,205 @@ class TradingLoop:
             "last_cycle": self.store.last_cycle(),
             "positions": self.store.list_positions(),
             "recent_orders": self.store.list_orders(limit=10),
+            "recent_reflections": self.store.list_reflections(limit=5),
         }
+
+    # ------------------------------------------------------------------ #
+    # Trade reflection — the "learn from actual trades" layer
+    # ------------------------------------------------------------------ #
+
+    _TRADE_REFLECTION_PROMPT = (
+        "You are a trading agent reviewing a trade you actually executed, now "
+        "that some time has passed and the outcome is known.\n"
+        "Write 3-5 sentences of plain prose (no bullets, no headers, no markdown).\n\n"
+        "Cover in order:\n"
+        "1. Was the trade direction correct? (cite the PnL figure)\n"
+        "2. Was the entry timing good, or did you buy high / sell low?\n"
+        "3. Which part of the original investment thesis held or failed?\n"
+        "4. One concrete, actionable lesson for the next trade on this asset.\n\n"
+        "Be specific and honest. Your output will be stored and re-read by "
+        "future analysis runs, so every word must earn its place."
+    )
+
+    def reflect_on_trades(self, min_age_hours: float = 0, max_trades: int = 10) -> list[dict[str, Any]]:
+        """Review filled trades that haven't been reflected on yet.
+
+        For each unreflected filled order:
+          1. Fetch the current price from the exchange.
+          2. Compute PnL (entry vs current, for BUY) or opportunity cost (for SELL).
+          3. Call the LLM to generate a 3-5 sentence reflection + lesson.
+          4. Store the reflection in SQLite (trade_reflections table).
+          5. Append the lesson to the TradingMemoryLog so the next analysis
+             run on the same ticker can read it via get_past_context().
+
+        Returns the list of reflection summaries (newest last).
+        """
+        broker = self.get_broker()
+        pending = self.store.get_filled_orders_for_reflection(min_age_hours=min_age_hours)
+        if not pending:
+            logger.info("reflect_on_trades: no pending trades to reflect on")
+            return []
+
+        # Build the LLM lazily (reuse the graph's quick-thinking model so we
+        # share the same provider/key as the analysis layer).
+        llm = self._get_reflection_llm()
+
+        results: list[dict[str, Any]] = []
+        for trade in pending[:max_trades]:
+            sym = trade.get("symbol") or ""
+            action = trade.get("action") or ""
+            entry_price = trade.get("entry_price")
+            amount = trade.get("amount") or 0
+            decision_md = trade.get("decision_md") or "(decision text not recorded)"
+
+            # Fetch current price.
+            try:
+                current_price = broker._fetch_price(sym)
+            except Exception as exc:
+                logger.warning("reflect: can't fetch price for %s: %s", sym, exc)
+                current_price = None
+
+            # Compute PnL.
+            # For BUY: PnL = (current - entry) * amount  (unrealized, assumes still holding)
+            # For SELL: PnL = (entry - current) * amount  (opportunity saved/given up
+            #           by selling — positive means selling was the right call)
+            pnl_quote = None
+            pnl_pct = None
+            if entry_price and current_price and amount:
+                if action == "BUY":
+                    pnl_quote = (current_price - entry_price) * amount
+                    cost = entry_price * amount
+                    pnl_pct = (pnl_quote / cost * 100) if cost else None
+                elif action == "SELL":
+                    # SELL "PnL" = how much we saved (or lost) by selling vs holding
+                    pnl_quote = (entry_price - current_price) * amount
+                    proceeds = entry_price * amount
+                    pnl_pct = (pnl_quote / proceeds * 100) if proceeds else None
+
+            holding_hours = (time.time() - trade.get("order_ts", time.time())) / 3600
+
+            # Call the LLM for reflection.
+            reflection_text = "(LLM unavailable — reflection skipped)"
+            lessons = None
+            if llm is not None:
+                try:
+                    pnl_desc = "unknown"
+                    if pnl_pct is not None:
+                        pnl_desc = f"{pnl_pct:+.2f}%"
+                    prompt_body = (
+                        f"Trade: {action} {amount} {sym} @ {entry_price}\n"
+                        f"Current price: {current_price}\n"
+                        f"PnL: {pnl_desc} ({pnl_quote:+.2f} quote units "
+                        f"if holding{' (opportunity cost for SELL)' if action == 'SELL' else ''})\n"
+                        f"Hours since trade: {holding_hours:.1f}\n\n"
+                        f"Original decision that drove this trade:\n{decision_md}"
+                    )
+                    from langchain_core.messages import HumanMessage, SystemMessage
+                    msg = llm.invoke([
+                        SystemMessage(content=self._TRADE_REFLECTION_PROMPT),
+                        HumanMessage(content=prompt_body),
+                    ])
+                    reflection_text = msg.content if hasattr(msg, "content") else str(msg)
+                    # Extract the last sentence as the "lesson" for quick injection.
+                    sentences = [s.strip() for s in reflection_text.split(".") if s.strip()]
+                    lessons = sentences[-1] + "." if sentences else reflection_text
+                except Exception as exc:
+                    logger.error("reflect: LLM call failed: %s", exc)
+                    reflection_text = f"(LLM reflection failed: {exc})"
+
+            # Store in SQLite.
+            self.store.record_reflection(
+                order_id=trade.get("order_id"),
+                cycle_id=trade.get("cycle_id"),
+                ticker=trade.get("ticker", sym),
+                action=action,
+                rating=trade.get("rating"),
+                entry_price=entry_price,
+                current_price=current_price,
+                amount=amount,
+                pnl_quote=pnl_quote,
+                pnl_pct=pnl_pct,
+                holding_hours=holding_hours,
+                decision_md=decision_md,
+                reflection_text=reflection_text,
+                lessons=lessons,
+            )
+
+            # Write back to the TradingMemoryLog so the next analysis run
+            # can read the trade lesson via get_past_context().
+            self._append_trade_lesson_to_memory(
+                ticker=trade.get("ticker", sym),
+                action=action,
+                sym=sym,
+                pnl_pct=pnl_pct,
+                lessons=lessons or reflection_text,
+            )
+
+            summary = {
+                "order_id": trade.get("order_id"),
+                "ticker": trade.get("ticker", sym),
+                "action": action,
+                "entry_price": entry_price,
+                "current_price": current_price,
+                "pnl_pct": pnl_pct,
+                "reflection": reflection_text[:120] + "..." if len(reflection_text) > 120 else reflection_text,
+            }
+            results.append(summary)
+            self._log_reflection(summary)
+
+        return results
+
+    def _get_reflection_llm(self):
+        """Return the LLM to use for trade reflection.
+
+        Reuses the graph's quick-thinking LLM (same provider/key as analysis)
+        so we don't need a separate config. Falls back to None if the graph
+        can't be built (e.g. missing API key), in which case reflection
+        records PnL but skips the LLM prose.
+        """
+        try:
+            graph = self.get_graph()
+            return graph.quick_thinking_llm
+        except Exception as exc:
+            logger.warning("can't build LLM for reflection: %s", exc)
+            return None
+
+    def _append_trade_lesson_to_memory(
+        self, ticker: str, action: str, sym: str, pnl_pct: float | None, lessons: str
+    ) -> None:
+        """Append a trade-reflection entry to the TradingMemoryLog.
+
+        Uses a tag format compatible with the existing parser so
+        get_past_context() picks it up on the next run. The entry is written
+        as already-resolved (not pending) since the outcome is known.
+        """
+        try:
+            from pathlib import Path
+            log_path = Path(self.config.get("memory_log_path", "")).expanduser()
+            if not log_path:
+                return
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+
+            pnl_str = f"{pnl_pct:+.1f}%" if pnl_pct is not None else "n/a"
+            tag = f"[{dt.date.today().isoformat()} | {ticker} | TRADE:{action} | {pnl_str} | 0% | 0d]"
+            entry = (
+                f"{tag}\n\n"
+                f"DECISION:\n(Trade reflection: {action} {sym}, PnL {pnl_str})\n\n"
+                f"REFLECTION:\n{lessons}\n\n"
+                f"<!-- ENTRY_END -->\n\n"
+            )
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(entry)
+            logger.info("trade lesson appended to memory log: %s %s %s", ticker, action, pnl_str)
+        except Exception as exc:
+            logger.warning("failed to append trade lesson to memory log: %s", exc)
+
+    @staticmethod
+    def _log_reflection(s: dict[str, Any]) -> None:
+        pnl = f"{s['pnl_pct']:+.2f}%" if s.get("pnl_pct") is not None else "n/a"
+        print(
+            f"[reflection] order={s['order_id']} {s['ticker']} "
+            f"{s['action']} entry={s.get('entry_price')} now={s.get('current_price')} "
+            f"pnl={pnl}",
+            flush=True,
+        )

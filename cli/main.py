@@ -1588,5 +1588,45 @@ def status():
         console.print("  (none)")
 
 
+@app.command(help="Reflect on filled trades: fetch current prices, compute PnL, "
+                  "and call the LLM to generate lessons. Results are stored in "
+                  "SQLite and appended to the memory log so the next analysis "
+                  "run can learn from them.")
+def reflect(
+    min_age_hours: float = typer.Option(
+        0.0, "--min-age-hours",
+        help="Only reflect on trades at least this many hours old. "
+             "Defaults to 0 (reflect immediately on all unreflected fills).",
+    ),
+    max_trades: int = typer.Option(
+        10, "--max-trades",
+        help="Maximum number of trades to reflect on in one invocation.",
+    ),
+):
+    """Trigger trade reflection manually (also runs automatically every N cycles)."""
+    from tradingagents.runner.loop import TradingLoop
+
+    loop = TradingLoop()
+    console.print(f"[green]Reflecting[/green] on unreflected filled trades "
+                  f"(min_age={min_age_hours}h, max={max_trades})...")
+
+    results = loop.reflect_on_trades(min_age_hours=min_age_hours, max_trades=max_trades)
+
+    if not results:
+        console.print("[yellow]No pending trades to reflect on.[/yellow]")
+        return
+
+    console.print(f"\n[bold green]Reflected on {len(results)} trade(s):[/bold green]\n")
+    for r in results:
+        pnl = f"{r['pnl_pct']:+.2f}%" if r.get("pnl_pct") is not None else "n/a"
+        console.print(
+            f"  order={r['order_id']} {r['ticker']} {r['action']} "
+            f"entry={r.get('entry_price')} now={r.get('current_price')} "
+            f"pnl={pnl}"
+        )
+        if r.get("reflection"):
+            console.print(f"    [dim]{r['reflection']}[/dim]")
+
+
 if __name__ == "__main__":
     app()
