@@ -583,6 +583,8 @@ class TradingAgentsGraph:
             quote_budget=self.config.get("crypto_quote_budget", 1000.0),
             max_position_fraction=self.config.get("crypto_max_position", 0.2),
             cooldown_seconds=self.config.get("crypto_cooldown_seconds", 14400.0),
+            passphrase=self.config.get("crypto_passphrase"),
+            https_proxy=self.config.get("crypto_https_proxy"),
         )
         # Broker only reads .rating; the prose fields are unused for sizing.
         decision = PortfolioDecision(

@@ -33,9 +33,19 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_CRYPTO_EXCHANGE":         "crypto_exchange",
     "TRADINGAGENTS_CRYPTO_API_KEY":          "crypto_api_key",
     "TRADINGAGENTS_CRYPTO_SECRET":           "crypto_secret",
+    "TRADINGAGENTS_CRYPTO_PASSPHRASE":       "crypto_passphrase",
+    "TRADINGAGENTS_CRYPTO_HTTPS_PROXY":      "crypto_https_proxy",
     "TRADINGAGENTS_CRYPTO_QUOTE_BUDGET":     "crypto_quote_budget",
     "TRADINGAGENTS_CRYPTO_MAX_POSITION":     "crypto_max_position",
     "TRADINGAGENTS_CRYPTO_COOLDOWN_SECONDS": "crypto_cooldown_seconds",
+    # --- Autonomous runner (optional, off by default) ---
+    # The runner wraps propagate() in a loop. Disabled unless explicitly turned
+    # on; when off the framework behaves as a single-shot CLI/script.
+    "TRADINGAGENTS_RUNNER_ENABLED":          "runner_enabled",
+    "TRADINGAGENTS_RUNNER_INTERVAL_SECONDS": "runner_interval_seconds",
+    "TRADINGAGENTS_RUNNER_MAX_CYCLES":       "runner_max_cycles",
+    "TRADINGAGENTS_RUNNER_TICKERS":          "runner_tickers",
+    "TRADINGAGENTS_RUNNER_DB_PATH":          "runner_db_path",
 }
 
 
@@ -185,6 +195,13 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "crypto_exchange": "binance",
     "crypto_api_key": None,
     "crypto_secret": None,
+    # OKX requires a passphrase (the 3rd credential set when creating the API
+    # key); Binance/Bybit/Kraken ignore it. Mapped to ccxt's `password` field.
+    "crypto_passphrase": None,
+    # Optional HTTPS proxy for the ccxt session. Needed in networks where the
+    # exchange domain is unreachable directly (e.g. OKX from mainland China).
+    # Example: "http://127.0.0.1:7897". None = direct connection.
+    "crypto_https_proxy": None,
     # Max quote currency (USDT) to spend on a single BUY. Caps risk per signal.
     "crypto_quote_budget": 1000.0,
     # Max fraction of total account equity to hold in a single base asset
@@ -193,4 +210,25 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # Minimum seconds between orders on the same symbol. Guards against the
     # non-deterministic LLM re-issuing the same signal within a session.
     "crypto_cooldown_seconds": 14400,  # 4 hours
+
+    # --- Autonomous runner (optional, OFF by default) ---
+    # Wraps propagate() in a scheduled loop. When enabled, the runner takes a
+    # list of tickers, runs the full analysis -> decision -> broker order
+    # pipeline for each on a fixed interval, and persists positions + orders to
+    # a SQLite DB so the agent knows what it holds between cycles. Disabled
+    # unless the user opts in — the default framework behavior is single-shot.
+    "runner_enabled": False,
+    # Seconds between the start of consecutive cycles. The LLM analysis itself
+    # can take several minutes, so the effective cadence is max(interval,
+    # analysis_runtime). 3600s = 1 hour is a reasonable default for crypto.
+    "runner_interval_seconds": 3600,
+    # Hard cap on total cycles across all tickers. 0 = run forever (until
+    # interrupted). Useful for "run 3 cycles then stop" smoke tests.
+    "runner_max_cycles": 0,
+    # Comma-separated tickers to analyze each cycle, e.g. "BTC-USD,ETH-USD".
+    # Each ticker is analyzed sequentially within a cycle.
+    "runner_tickers": "BTC-USD",
+    # SQLite path for the runner state store. None = default under
+    # data_cache_dir/runner_state.db.
+    "runner_db_path": None,
 })

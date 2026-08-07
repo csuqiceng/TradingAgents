@@ -93,6 +93,8 @@ class CryptoBroker(BaseBroker):
         max_position_fraction: float = 0.2,
         cooldown_seconds: float = 14400.0,
         cooldown_state_path: str | None = None,
+        passphrase: str | None = None,
+        https_proxy: str | None = None,
         exchange: Any | None = None,
     ):
         # ``exchange`` injection is for tests; production code passes credentials.
@@ -107,14 +109,25 @@ class CryptoBroker(BaseBroker):
                     'pip install "tradingagents[crypto]"  (or: pip install ccxt)'
                 ) from exc
             exchange_cls = getattr(ccxt, exchange_id)
-            self.exchange = exchange_cls(
-                {
-                    "apiKey": api_key,
-                    "secret": secret,
-                    "enableRateLimit": True,
-                    "options": {"defaultType": "spot"},
-                }
-            )
+            ccxt_params: dict[str, Any] = {
+                "apiKey": api_key,
+                "secret": secret,
+                "enableRateLimit": True,
+                "options": {"defaultType": "spot"},
+            }
+            # OKX requires a passphrase (the 3rd credential created alongside
+            # the API key); other exchanges ignore `password`. Only set it when
+            # provided so we don't send an empty string that some exchanges
+            # reject.
+            if passphrase:
+                ccxt_params["password"] = passphrase
+            # Optional HTTPS proxy — needed when the exchange domain is blocked
+            # on the host network (e.g. OKX from mainland China). ccxt accepts
+            # only one of httpProxy/httpsProxy/socksProxy, so we set httpsProxy
+            # since exchange APIs are HTTPS.
+            if https_proxy:
+                ccxt_params["httpsProxy"] = https_proxy
+            self.exchange = exchange_cls(ccxt_params)
             # Sandbox/testnet must be enabled *before* any authenticated call.
             # Binance/OKX/Bybit all honor set_sandbox_mode(True).
             if testnet:
@@ -366,3 +379,123 @@ class CryptoBroker(BaseBroker):
             # If precision formatting fails, refuse rather than risk a
             # rejected or wrong-size order.
             return 0.0
+
+    # ------------------------------------------------------------------ #
+    # Account query API — used by the autonomous runner (TradingLoop) to
+    # snapshot balances/positions before deciding, and to reconcile local
+    # state with the exchange after fills. NOT part of BaseBroker: stock
+    # brokers may expose a different shape, so these are CryptoBroker-only.
+    # ------------------------------------------------------------------ #
+
+    def get_account_snapshot(self) -> dict[str, Any]:
+        """Return a compact account snapshot: non-zero balances + equity.
+
+        Shape::
+
+            {
+              "exchange": "okx",
+              "testnet": True,
+              "equity_quote": 229628.64,      # USDT total
+              "balances": {
+                  "USDT": {"free": ..., "used": ..., "total": ...},
+                  "BTC":  {"free": ..., "used": ..., "total": ...},
+                  ...
+              },
+              "timestamp": 1786114213.0,
+            }
+
+        Only non-zero assets are included. Errors surface as a dict with
+        ``"error"`` so callers (the runner) can decide whether to skip the
+        cycle or abort.
+        """
+        try:
+            raw = self._fetch_balance()
+        except Exception as exc:
+            logger.error("get_account_snapshot failed: %s", exc)
+            return {"exchange": self.exchange.id, "error": str(exc)}
+
+        balances: dict[str, dict[str, float]] = {}
+        for asset, val in raw.items():
+            # Skip ccxt meta keys like 'info', 'timestamp', 'datetime', 'free',
+            # 'used', 'total' (top-level aggregates ccxt adds).
+            if asset in ("info", "timestamp", "datetime", "free", "used", "total"):
+                continue
+            if not isinstance(val, dict):
+                continue
+            total = val.get("total") or 0
+            if not total or float(total) <= 0:
+                continue
+            balances[asset] = {
+                "free": float(val.get("free") or 0),
+                "used": float(val.get("used") or 0),
+                "total": float(total),
+            }
+
+        return {
+            "exchange": self.exchange.id,
+            "testnet": self.testnet,
+            "equity_quote": self._quote_equity(raw),
+            "balances": balances,
+            "timestamp": raw.get("timestamp") or 0,
+        }
+
+    def get_position(self, symbol: str) -> dict[str, Any]:
+        """Return the base-asset position for ``symbol`` (e.g. BTC/USDT).
+
+        Shape::
+
+            {"symbol": "BTC/USDT", "base": "BTC", "free": 0.0153,
+             "used": 0.0, "total": 0.0153, "price": 65098.5,
+             "value_quote": 998.0}
+        """
+        ccxt_symbol = to_ccxt_symbol(symbol)
+        base = ccxt_symbol.split("/")[0]
+        try:
+            raw = self._fetch_balance()
+            price = self._fetch_price(ccxt_symbol)
+        except Exception as exc:
+            logger.error("get_position failed for %s: %s", ccxt_symbol, exc)
+            return {"symbol": ccxt_symbol, "base": base, "error": str(exc)}
+
+        val = raw.get(base, {}) or {}
+        total = float(val.get("total") or 0)
+        return {
+            "symbol": ccxt_symbol,
+            "base": base,
+            "free": float(val.get("free") or 0),
+            "used": float(val.get("used") or 0),
+            "total": total,
+            "price": price,
+            "value_quote": total * price,
+        }
+
+    def get_recent_orders(self, symbol: str, limit: int = 10) -> list[dict[str, Any]]:
+        """Return recent closed orders for ``symbol`` (newest first).
+
+        OKX does not support ``fetchOrders`` (all statuses); we use
+        ``fetch_closed_orders`` which returns filled/canceled orders. Each row
+        is trimmed to the fields the runner/local-state layer cares about.
+        """
+        ccxt_symbol = to_ccxt_symbol(symbol)
+        try:
+            # fetch_closed_orders is the ccxt method that works on OKX.
+            raw = self.exchange.fetch_closed_orders(ccxt_symbol, limit=limit)
+        except Exception as exc:
+            logger.error("get_recent_orders failed for %s: %s", ccxt_symbol, exc)
+            return []
+        out: list[dict[str, Any]] = []
+        for o in raw:
+            out.append({
+                "id": o.get("id"),
+                "datetime": o.get("datetime"),
+                "timestamp": o.get("timestamp"),
+                "side": o.get("side"),
+                "type": o.get("type"),
+                "amount": o.get("amount"),
+                "filled": o.get("filled"),
+                "average": o.get("average"),
+                "cost": o.get("cost"),
+                "status": o.get("status"),
+                "symbol": o.get("symbol"),
+            })
+        return out

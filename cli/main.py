@@ -1460,7 +1460,132 @@ def analyze(
             "rather than a piped or embedded terminal.",
             err=True,
         )
-        raise typer.Exit(code=1) from None
+
+
+@app.command(help="Run the autonomous trading loop: analyze -> decide -> trade, "
+                  "on a schedule, across one or more tickers. Configure via "
+                  "TRADINGAGENTS_RUNNER_* env vars (see .env.example).")
+def run(
+    once: bool = typer.Option(
+        False, "--once",
+        help="Run a single cycle for each ticker and exit (no scheduling). "
+             "Useful for smoke tests and cron-driven invocations.",
+    ),
+    ticker: str | None = typer.Option(
+        None, "--ticker",
+        help="Override the ticker list for this run (comma-separated, e.g. "
+             "BTC-USD,ETH-USD). Defaults to TRADINGAGENTS_RUNNER_TICKERS.",
+    ),
+    interval: int | None = typer.Option(
+        None, "--interval",
+        help="Override the seconds between cycles. Defaults to "
+             "TRADINGAGENTS_RUNNER_INTERVAL_SECONDS.",
+    ),
+    max_cycles: int | None = typer.Option(
+        None, "--max-cycles",
+        help="Stop after this many total cycles (across all tickers). "
+             "0 = run forever. Defaults to TRADINGAGENTS_RUNNER_MAX_CYCLES.",
+    ),
+):
+    """Start the autonomous trading loop."""
+    from tradingagents.runner.loop import TradingLoop
+
+    config = DEFAULT_CONFIG.copy()
+    if ticker:
+        config["runner_tickers"] = ticker
+    if interval is not None:
+        config["runner_interval_seconds"] = interval
+    if max_cycles is not None:
+        config["runner_max_cycles"] = max_cycles
+
+    # Execution must be on for the loop to actually trade; warn if not.
+    if not config.get("execution_enabled"):
+        console.print(
+            "[yellow]Warning: execution_enabled is false — the loop will run "
+            "analysis but place no orders.[/yellow]"
+        )
+
+    loop = TradingLoop(config=config)
+    console.print(
+        f"[green]TradingLoop[/green] tickers={loop.tickers} "
+        f"interval={loop.interval}s max_cycles={loop.max_cycles or 'inf'}"
+    )
+
+    if once:
+        for t in loop.tickers:
+            summary = loop.run_once(t)
+            console.print(
+                f"[cycle {summary['cycle_id']}] {summary['ticker']} @ "
+                f"{summary['trade_date']} -> rating={summary['rating']} "
+                f"order={summary['order_status']}"
+                + (" [red]ERROR[/red]" if summary.get("error") else "")
+            )
+    else:
+        loop.run_forever()
+
+
+@app.command(help="Show the autonomous runner's current state: last cycle, "
+                  "cached positions, and recent orders. No network calls "
+                  "(reads from the local SQLite store only).")
+def status():
+    """Print the runner's local state cache."""
+    from tradingagents.runner.loop import TradingLoop
+
+    loop = TradingLoop()
+    st = loop.status()
+
+    console.print("[bold green]=== TradingLoop status ===[/bold green]\n")
+
+    console.print(f"Tickers: {', '.join(st['tickers'])}  "
+                  f"interval={st['interval_seconds']}s  "
+                  f"max_cycles={st['max_cycles'] or 'inf'}")
+
+    console.print("\n[bold]Last cycle:[/bold]")
+    lc = st["last_cycle"]
+    if lc:
+        table = Table(show_header=False, box=box.SIMPLE)
+        for k in ("id", "ts", "ticker", "trade_date", "status", "rating",
+                  "order_status", "equity_before", "equity_after", "duration_s", "error"):
+            if k in lc and lc[k] is not None:
+                table.add_row(k, str(lc[k]))
+        console.print(table)
+    else:
+        console.print("  (no cycles run yet)")
+
+    console.print("\n[bold]Cached positions (from exchange):[/bold]")
+    positions = st["positions"]
+    if positions:
+        ptable = Table(box=box.SIMPLE)
+        for col in ("symbol", "total", "free", "used", "price", "value_quote", "source"):
+            ptable.add_column(col)
+        for p in positions:
+            ptable.add_row(
+                str(p.get("symbol", "")),
+                str(p.get("total", "")),
+                str(p.get("free", "")),
+                str(p.get("used", "")),
+                str(p.get("price", "")),
+                str(p.get("value_quote", "")),
+                str(p.get("source", "")),
+            )
+        console.print(ptable)
+    else:
+        console.print("  (none cached — run `tradingagents run --once` to populate)")
+
+    console.print("\n[bold]Recent orders:[/bold]")
+    orders = st["recent_orders"]
+    if orders:
+        otable = Table(box=box.SIMPLE)
+        for col in ("id", "ts", "symbol", "action", "status", "rating",
+                    "price", "amount", "exchange_order_id"):
+            otable.add_column(col)
+        for o in orders:
+            otable.add_row(*[str(o.get(c, "")) for c in
+                             ("id", "ts", "symbol", "action", "status", "rating",
+                              "price", "amount", "exchange_order_id")])
+        console.print(otable)
+    else:
+        console.print("  (none)")
 
 
 if __name__ == "__main__":
