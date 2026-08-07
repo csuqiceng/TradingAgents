@@ -25,6 +25,17 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_GOOGLE_THINKING_LEVEL":   "google_thinking_level",
     "TRADINGAGENTS_OPENAI_REASONING_EFFORT": "openai_reasoning_effort",
     "TRADINGAGENTS_ANTHROPIC_EFFORT":        "anthropic_effort",
+    # --- Crypto execution layer (optional, off by default) ---
+    # All execution knobs are env-overridable so a live run can be configured
+    # purely via .env without editing code. Default to paper/testnet.
+    "TRADINGAGENTS_EXECUTION_ENABLED":       "execution_enabled",
+    "TRADINGAGENTS_EXECUTION_MODE":          "execution_mode",
+    "TRADINGAGENTS_CRYPTO_EXCHANGE":         "crypto_exchange",
+    "TRADINGAGENTS_CRYPTO_API_KEY":          "crypto_api_key",
+    "TRADINGAGENTS_CRYPTO_SECRET":           "crypto_secret",
+    "TRADINGAGENTS_CRYPTO_QUOTE_BUDGET":     "crypto_quote_budget",
+    "TRADINGAGENTS_CRYPTO_MAX_POSITION":     "crypto_max_position",
+    "TRADINGAGENTS_CRYPTO_COOLDOWN_SECONDS": "crypto_cooldown_seconds",
 }
 
 
@@ -161,4 +172,25 @@ DEFAULT_CONFIG = _apply_env_overrides({
         ".SZ":  "399001.SZ",   # Shenzhen (SZSE Component)
         "":     "SPY",         # default for US-listed tickers (no suffix)
     },
+    # --- Crypto execution layer (optional) ---
+    # Off by default: when False, runs only produce analysis reports and never
+    # place orders. Enable only after reading the risk notes in the README and
+    # tradingagents/execution/crypto_broker.py.
+    "execution_enabled": False,
+    # "paper" routes orders to the exchange testnet (e.g. Binance testnet /
+    # OKX sandbox). "live" uses real funds — never start here.
+    "execution_mode": "paper",
+    # ccxt exchange id. Spot only; futures are intentionally not supported.
+    # Common: binance, okx, bybit, kraken, coinbase.
+    "crypto_exchange": "binance",
+    "crypto_api_key": None,
+    "crypto_secret": None,
+    # Max quote currency (USDT) to spend on a single BUY. Caps risk per signal.
+    "crypto_quote_budget": 1000.0,
+    # Max fraction of total account equity to hold in a single base asset
+    # (e.g. 0.2 = 20% in BTC). Sell orders are unaffected.
+    "crypto_max_position": 0.2,
+    # Minimum seconds between orders on the same symbol. Guards against the
+    # non-deterministic LLM re-issuing the same signal within a session.
+    "crypto_cooldown_seconds": 14400,  # 4 hours
 })

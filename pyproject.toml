@@ -44,6 +44,11 @@ dev = [
 bedrock = [
     "langchain-aws>=1.5.0",
 ]
+# Spot-crypto order execution via ccxt. Optional so analysis-only users don't
+# pull in exchange-SDK dependencies. pip install "tradingagents[crypto]".
+crypto = [
+    "ccxt>=4.4.0",
+]
 
 [project.scripts]
 tradingagents = "cli.main:app"

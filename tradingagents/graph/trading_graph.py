@@ -10,6 +10,8 @@ from typing import Any
 import yfinance as yf
 from langgraph.prebuilt import ToolNode
 
+from tradingagents.agents.schemas import PortfolioDecision, PortfolioRating
+
 # Import the abstract tool methods from agent_utils
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
@@ -28,6 +30,7 @@ from tradingagents.agents.utils.agent_utils import (
     resolve_instrument_identity,
 )
 from tradingagents.agents.utils.memory import TradingMemoryLog
+from tradingagents.agents.utils.rating import parse_rating
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -479,6 +482,15 @@ class TradingAgentsGraph:
                 self._run_signature(asset_type),
             )
 
+        # Optional execution layer: translate the final decision into a real
+        # broker order. Disabled by default; only runs when the user opts in
+        # via execution_enabled. Failures are recorded, never raised, so a
+        # broker outage can't void an otherwise-complete analysis run.
+        if self.config.get("execution_enabled"):
+            final_state["executed_order"] = self._execute_decision(
+                company_name, asset_type, final_state["final_trade_decision"]
+            )
+
         return final_state, self.process_signal(final_state["final_trade_decision"])
 
     def _log_state(self, trade_date, final_state):
@@ -522,6 +534,68 @@ class TradingAgentsGraph:
         log_path = directory / f"full_states_log_{trade_date}.json"
         with open(log_path, "w", encoding="utf-8") as f:
             json.dump(self.log_states_dict[str(trade_date)], f, indent=4)
+
+    def _execute_decision(
+        self, ticker: str, asset_type: str, final_decision_markdown: str
+    ) -> dict:
+        """Translate the PM's final decision into a broker order.
+
+        Currently only the ``crypto`` asset type is wired to a real broker
+        (``CryptoBroker`` via ccxt, spot only). Stocks return a ``skipped``
+        result rather than raising, so a stock run with execution_enabled
+        still completes — execution support for equities can be added behind
+        the same interface later.
+
+        The decision markdown is parsed back to a 5-tier rating via the
+        shared heuristic (``parse_rating``); the broker only consumes the
+        rating, so we don't need the full structured ``PortfolioDecision``
+        that was rendered to markdown upstream.
+        """
+        rating_str = parse_rating(final_decision_markdown)
+        try:
+            rating = PortfolioRating(rating_str)
+        except ValueError:
+            logger.warning(
+                "Unrecognized rating %r from PM decision; skipping execution.",
+                rating_str,
+            )
+            return {"status": "skipped", "reason": f"unrecognized rating {rating_str!r}"}
+
+        if asset_type != "crypto":
+            return {
+                "status": "skipped",
+                "reason": (
+                    f"execution not implemented for asset_type={asset_type!r} "
+                    "(only crypto is supported)"
+                ),
+                "rating": rating.value,
+            }
+
+        # Late import: ccxt is an optional dependency, and the whole execution
+        # package must not be imported when execution is disabled (default).
+        from tradingagents.execution import CryptoBroker
+
+        broker = CryptoBroker(
+            exchange_id=self.config.get("crypto_exchange", "binance"),
+            api_key=self.config.get("crypto_api_key"),
+            secret=self.config.get("crypto_secret"),
+            testnet=self.config.get("execution_mode", "paper") == "paper",
+            quote_budget=self.config.get("crypto_quote_budget", 1000.0),
+            max_position_fraction=self.config.get("crypto_max_position", 0.2),
+            cooldown_seconds=self.config.get("crypto_cooldown_seconds", 14400.0),
+        )
+        # Broker only reads .rating; the prose fields are unused for sizing.
+        decision = PortfolioDecision(
+            rating=rating,
+            executive_summary="",
+            investment_thesis="",
+        )
+        result = broker.place_order(ticker, decision)
+        logger.info(
+            "Execution result for %s (%s): %s — %s",
+            ticker, rating.value, result.get("status"), result.get("reason", ""),
+        )
+        return dict(result)
 
     def process_signal(self, full_signal):
         """Process a signal to extract the core decision."""
