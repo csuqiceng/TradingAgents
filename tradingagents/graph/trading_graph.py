@@ -362,7 +362,8 @@ class TradingAgentsGraph:
             f"asset={asset_type}",
         ])
 
-    def propagate(self, company_name, trade_date, asset_type: str = "stock"):
+    def propagate(self, company_name, trade_date, asset_type: str = "stock",
+                   execution_enabled: bool | None = None):
         """Run the trading agents graph for a company on a specific date.
 
         ``asset_type`` selects between the stock pipeline (default) and the
@@ -371,6 +372,10 @@ class TradingAgentsGraph:
         ``checkpoint_enabled`` is set in config, the graph is recompiled with
         a per-ticker SqliteSaver so a crashed run can resume from the last
         successful node on a subsequent invocation with the same ticker+date.
+
+        ``execution_enabled`` overrides ``config['execution_enabled']`` so the
+        caller (e.g. the parallel loop with warm-up protection) can control
+        execution per-cycle without mutating shared config (thread safety).
         """
         self.ticker = company_name
 
@@ -397,7 +402,8 @@ class TradingAgentsGraph:
                 logger.info("Starting fresh for %s on %s", company_name, trade_date)
 
         try:
-            return self._run_graph(company_name, trade_date, asset_type=asset_type)
+            return self._run_graph(company_name, trade_date, asset_type=asset_type,
+                                   execution_enabled=execution_enabled)
         finally:
             if self._checkpointer_ctx is not None:
                 self._checkpointer_ctx.__exit__(None, None, None)
@@ -419,8 +425,13 @@ class TradingAgentsGraph:
             )
         return write_report_tree(final_state, ticker, save_path)
 
-    def _run_graph(self, company_name, trade_date, asset_type: str = "stock"):
-        """Execute the graph and write the resulting state to disk and memory log."""
+    def _run_graph(self, company_name, trade_date, asset_type: str = "stock",
+                    execution_enabled: bool | None = None):
+        """Execute the graph and write the resulting state to disk and memory log.
+
+        ``execution_enabled`` overrides the config key; ``None`` falls back to
+        ``self.config.get("execution_enabled")`` for backward compatibility.
+        """
         # Initialize state — inject memory log context for PM and the
         # deterministically resolved instrument identity for all agents.
         past_context = self.memory_log.get_past_context(company_name)
@@ -431,7 +442,8 @@ class TradingAgentsGraph:
         # 2. Current holdings for this ticker — so the PM knows whether it
         #    already has a position, and can size SELL/BUY recommendations
         #    accordingly instead of making blind market calls.
-        if self.config.get("execution_enabled") and asset_type == "crypto":
+        _do_execute = execution_enabled if execution_enabled is not None else self.config.get("execution_enabled")
+        if _do_execute and asset_type == "crypto":
             try:
                 from tradingagents.execution import CryptoBroker
                 from tradingagents.execution.crypto_broker import to_ccxt_symbol
@@ -541,7 +553,8 @@ class TradingAgentsGraph:
         # broker order. Disabled by default; only runs when the user opts in
         # via execution_enabled. Failures are recorded, never raised, so a
         # broker outage can't void an otherwise-complete analysis run.
-        if self.config.get("execution_enabled"):
+        _do_execute = execution_enabled if execution_enabled is not None else self.config.get("execution_enabled")
+        if _do_execute:
             final_state["executed_order"] = self._execute_decision(
                 company_name, asset_type, final_state["final_trade_decision"]
             )
