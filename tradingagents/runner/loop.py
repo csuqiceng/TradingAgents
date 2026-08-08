@@ -241,6 +241,7 @@ class TradingLoop:
         order_result: dict[str, Any] | None = None
         error: str | None = None
         decision_md: str | None = None
+        report_path: str | None = None
 
         try:
             graph = self.get_graph()
@@ -251,6 +252,16 @@ class TradingLoop:
             # and the second call would always hit the cooldown the first
             # call just wrote, producing a misleading "skipped" record.
             final_state, decision_md = graph.propagate(ticker, trade_date, asset_type=asset_type)
+
+            # Save the full analysis report tree (analysts / debate / trader /
+            # risk / PM decision) to disk so every cycle has a reviewable
+            # audit trail, not just the parsed rating.
+            report_path = None
+            try:
+                report_path = str(graph.save_reports(final_state, ticker))
+                logger.info("analysis report saved: %s", report_path)
+            except Exception as exc:
+                logger.warning("save_reports failed for %s: %s", ticker, exc)
 
             # Parse rating for logging/DB (same heuristic the broker uses).
             from tradingagents.agents.utils.rating import parse_rating
@@ -313,6 +324,7 @@ class TradingLoop:
             equity_after=equity_after,
             error=error,
             decision_md=decision_md,
+            report_path=report_path,
         )
 
         return {
@@ -323,6 +335,7 @@ class TradingLoop:
             "order_status": order_status,
             "equity_before": equity_before,
             "equity_after": equity_after,
+            "report_path": report_path,
             "error": error,
         }
 

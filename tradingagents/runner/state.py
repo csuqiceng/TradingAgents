@@ -113,6 +113,9 @@ _MIGRATIONS = [
     # used by hold-decision reflection to evaluate "did the market move
     # against/for my HOLD since I decided?".
     "ALTER TABLE cycles ADD COLUMN price_at_decision REAL",
+    # Add report_path to cycles: filesystem location of the full analysis
+    # report tree (analysts / debate / trader / risk / PM) saved each cycle.
+    "ALTER TABLE cycles ADD COLUMN report_path TEXT",
 ]
 
 
@@ -287,17 +290,18 @@ class RunnerStateStore:
         equity_after: float | None = None,
         error: str | None = None,
         decision_md: str | None = None,
+        report_path: str | None = None,
     ) -> None:
         self._conn.execute(
             """
             UPDATE cycles SET
                 status = ?, rating = ?, order_status = ?, equity_after = ?,
                 error = ?, ended_at = ?, duration_s = ? - started_at,
-                decision_md = ?
+                decision_md = ?, report_path = ?
             WHERE id = ?
             """,
             (status, rating, order_status, equity_after, error, time.time(),
-             time.time(), decision_md, cycle_id),
+             time.time(), decision_md, report_path, cycle_id),
         )
         self._conn.commit()
 
