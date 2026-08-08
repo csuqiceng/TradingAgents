@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.execution.crypto_broker import CryptoBroker
+from tradingagents.runner.state import _MIGRATIONS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("daily_report")
@@ -62,6 +63,16 @@ def local_db() -> sqlite3.Connection:
     )
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    # Apply the same idempotent migrations as RunnerStateStore so querying
+    # decision_md / price_at_decision / report_path works even when daily_report
+    # runs against a DB that predates those columns. ALTER TABLE ADD COLUMN
+    # errors when the column already exists, which we ignore.
+    for stmt in _MIGRATIONS:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    conn.commit()
     return conn
 
 
@@ -142,6 +153,12 @@ def summarize_pnl(trades: list[dict]) -> dict:
             avg_cost = row["buy_cost"] / row["buy_qty"]
         else:
             avg_cost = None
+        # 只卖不买：动用历史持仓，当日无买入成本可估算，PnL 无法确定。
+        if row["buy_qty"] == 0 and row["sell_qty"] > 0:
+            row["pnl"] = None
+            row["pnl_pct"] = None
+            row["note"] = "动用历史持仓，无法估算成本"
+            continue
         pnl = row["sell_income"] - row["buy_cost"]
         # 若卖出量 > 买入量，超出部分按买入均价估算成本
         excess = row["sell_qty"] - row["buy_qty"]
@@ -155,11 +172,15 @@ def summarize_pnl(trades: list[dict]) -> dict:
             # est_cost 是全部卖出量的估算成本，pnl 修正为：
             pnl = row["sell_income"] - est_cost
         row["pnl"] = pnl
-        total_pnl += pnl
+        if pnl is not None:
+            total_pnl += pnl
 
     # 占比
     for row in by_symbol.values():
-        row["pnl_pct_share"] = (row["pnl"] / total_pnl * 100) if total_pnl else 0.0
+        if row["pnl"] is not None and total_pnl:
+            row["pnl_pct_share"] = row["pnl"] / total_pnl * 100
+        else:
+            row["pnl_pct_share"] = 0.0
 
     return {
         "by_symbol": dict(by_symbol),
@@ -253,9 +274,11 @@ def build_report(report_date: dt.date, trades: list[dict], decisions: list[dict]
     if pnl["by_symbol"]:
         L.append("")
         L.append("按币种占比：")
-        for sym, row in sorted(pnl["by_symbol"].items(), key=lambda x: -abs(x[1]["pnl"])):
+        for sym, row in sorted(pnl["by_symbol"].items(), key=lambda x: -abs(x[1]["pnl"] or 0)):
             share = f"{row['pnl_pct_share']:+.1f}%" if row["pnl_pct_share"] else "0.0%"
-            L.append(f"  • {sym}：{row['pnl']:+,.2f} USDT（占比 {share}，{row['n']} 笔）")
+            pnl_str = f"{row['pnl']:+,.2f} USDT" if row["pnl"] is not None else "N/A"
+            note_suffix = f"（{row['note']}）" if row.get("note") else ""
+            L.append(f"  • {sym}：{pnl_str}（占比 {share}，{row['n']} 笔）{note_suffix}")
     if equity_start is not None and equity_end is not None:
         eq_delta = equity_end - equity_start
         L.append(f"账户权益：{equity_start:,.2f} → {equity_end:,.2f} USDT（{eq_delta:+,.2f}）")

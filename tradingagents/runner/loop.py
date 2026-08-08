@@ -432,9 +432,9 @@ class TradingLoop:
         """Code-level hard stop-loss check for ``ticker``.
 
         If the runner holds a position on ``ticker`` and the current price is
-        more than ``crypto_stop_loss_pct`` below the last filled BUY price,
-        force-sell the entire free position at market — regardless of what the
-        LLM would decide. This is the one guard that cannot be argued out of:
+        more than ``crypto_stop_loss_pct`` below the volume-weighted average
+        entry price (VWAP of all filled BUYs), force-sell the entire free
+        position at market — regardless of what the LLM would decide. This is the one guard that cannot be argued out of:
         it lives in code, runs every cycle *before* the analysis, and does not
         consult the PM.
 
@@ -461,7 +461,7 @@ class TradingLoop:
         if total <= 0:
             return None  # nothing held — nothing to protect
 
-        entry = self.store.get_last_filled_buy_price(to_ccxt_symbol(ticker))
+        entry = self.store.get_vwap_entry_price(to_ccxt_symbol(ticker))
         if not entry or entry <= 0:
             return None  # no tracked entry price (e.g. manual position) — stay dormant
 

@@ -281,7 +281,8 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # Reflect on HOLD (no-trade) decisions every N cycles (0 = never).
     # Unlike trade reflection, this reviews decisions that did NOT result in
     # an order — "did my HOLD age well?" — so the system keeps learning even
-    # during idle stretches where nothing fills. 6 cycles at a 4h cadence ≈
-    # once per day.
-    "runner_reflect_hold_every_n_cycles": 6,
+    # during idle stretches where nothing fills. cycle_count increments per
+    # ticker (3 tickers × 6 outer rounds/day at 4h cadence = 18 cycle-runs/day),
+    # so 18 ≈ once per day.
+    "runner_reflect_hold_every_n_cycles": 18,
 })

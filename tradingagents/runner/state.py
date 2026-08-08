@@ -396,10 +396,15 @@ class RunnerStateStore:
     def get_last_filled_buy_price(self, symbol: str) -> float | None:
         """Return the fill price of the most recent filled BUY on ``symbol``.
 
-        Used by the hard stop-loss check to anchor the entry price. Returns
-        None when there is no filled buy on record (e.g. a position opened
-        manually outside the runner) — the stop-loss then stays dormant
-        rather than guessing an entry.
+        NOTE: this is the *last* buy price, NOT the position cost. With
+        multiple fills it diverges from the true blended entry (e.g. buying
+        0.1 @ 60000 then 0.05 @ 70000 returns 70000, not the 63333 VWAP).
+        New stop-loss anchoring should use :meth:`get_vwap_entry_price`
+        instead. Retained for callers that specifically want the most recent
+        fill.
+
+        Returns None when there is no filled buy on record (e.g. a position
+        opened manually outside the runner).
         """
         cur = self._conn.execute(
             """
@@ -412,6 +417,38 @@ class RunnerStateStore:
         )
         row = cur.fetchone()
         return float(row[0]) if row else None
+
+    def get_vwap_entry_price(self, symbol: str) -> float | None:
+        """Return the volume-weighted average price (VWAP) of all filled BUY
+        orders on ``symbol``.
+
+        This is the correct entry-price anchor for the hard stop-loss: when
+        the runner has added to a position across multiple fills (e.g.
+        0.1 @ 60000 then 0.05 @ 70000), the VWAP (63333) reflects the true
+        blended cost, whereas the last-fill price (70000) would stop out too
+        early.
+
+        Returns None when there is no filled BUY on record (e.g. a position
+        opened manually outside the runner) — the stop-loss then stays
+        dormant rather than guessing an entry.
+        """
+        cur = self._conn.execute(
+            """
+            SELECT price, amount FROM orders
+            WHERE symbol = ? AND action = 'BUY' AND status = 'filled'
+              AND price IS NOT NULL AND amount IS NOT NULL AND amount > 0
+            ORDER BY ts ASC
+            """,
+            (symbol,),
+        )
+        total_cost = 0.0
+        total_qty = 0.0
+        for price, amount in cur.fetchall():
+            total_cost += price * amount
+            total_qty += amount
+        if total_qty <= 0:
+            return None
+        return total_cost / total_qty
 
     def get_hold_decisions_for_reflection(
         self, min_age_hours: float = 0, limit: int = 10
