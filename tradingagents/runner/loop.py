@@ -240,6 +240,7 @@ class TradingLoop:
         order_status: str | None = None
         order_result: dict[str, Any] | None = None
         error: str | None = None
+        decision_md: str | None = None
 
         try:
             graph = self.get_graph()
@@ -269,10 +270,13 @@ class TradingLoop:
             order_status = order_result.get("status")
 
             # 4. Refresh the position for this symbol from the exchange.
-            try:
-                self.refresh_position(ticker)
-            except Exception as exc:
-                logger.warning("post-cycle position refresh failed: %s", exc)
+            # Only crypto tickers have an exchange position; stock tickers
+            # (e.g. A-shares) are analysis-only and have no broker symbol.
+            if _is_crypto(ticker):
+                try:
+                    self.refresh_position(ticker)
+                except Exception as exc:
+                    logger.warning("post-cycle position refresh failed: %s", exc)
 
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
