@@ -38,6 +38,9 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_CRYPTO_QUOTE_BUDGET":     "crypto_quote_budget",
     "TRADINGAGENTS_CRYPTO_MAX_POSITION":     "crypto_max_position",
     "TRADINGAGENTS_CRYPTO_COOLDOWN_SECONDS": "crypto_cooldown_seconds",
+    "TRADINGAGENTS_CRYPTO_BUY_COOLDOWN_SECONDS":  "crypto_buy_cooldown_seconds",
+    "TRADINGAGENTS_CRYPTO_SELL_COOLDOWN_SECONDS": "crypto_sell_cooldown_seconds",
+    "TRADINGAGENTS_CRYPTO_STOP_LOSS_PCT":    "crypto_stop_loss_pct",
     # --- Autonomous runner (optional, off by default) ---
     # The runner wraps propagate() in a loop. Disabled unless explicitly turned
     # on; when off the framework behaves as a single-shot CLI/script.
@@ -48,6 +51,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_RUNNER_DB_PATH":          "runner_db_path",
     "TRADINGAGENTS_RUNNER_REFLECT_EVERY_N_CYCLES": "runner_reflect_every_n_cycles",
     "TRADINGAGENTS_RUNNER_REFLECT_MIN_AGE_HOURS":  "runner_reflect_min_age_hours",
+    "TRADINGAGENTS_RUNNER_REFLECT_HOLD_EVERY_N_CYCLES": "runner_reflect_hold_every_n_cycles",
 }
 
 
@@ -88,6 +92,23 @@ def _apply_env_overrides(config: dict) -> dict:
             config[key] = _coerce(raw, config.get(key))
         except ValueError as exc:
             raise ValueError(f"Invalid value for {env_var}: {exc}") from exc
+
+    # Legacy cooldown fallback: ``TRADINGAGENTS_CRYPTO_COOLDOWN_SECONDS`` (the
+    # pre-direction single-value knob) must keep working for existing
+    # deployments. If it is set and neither direction-aware env var is, seed
+    # both direction keys from it. Direction-aware vars always win when
+    # explicitly set.
+    legacy_cooldown = os.environ.get("TRADINGAGENTS_CRYPTO_COOLDOWN_SECONDS")
+    if (
+        legacy_cooldown
+        and not os.environ.get("TRADINGAGENTS_CRYPTO_BUY_COOLDOWN_SECONDS")
+        and not os.environ.get("TRADINGAGENTS_CRYPTO_SELL_COOLDOWN_SECONDS")
+    ):
+        legacy_value = config.get("crypto_cooldown_seconds")
+        if legacy_value is not None:
+            config["crypto_buy_cooldown_seconds"] = legacy_value
+            config["crypto_sell_cooldown_seconds"] = legacy_value
+
     return config
 
 
@@ -207,13 +228,25 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # Example: "http://127.0.0.1:7897". None = direct connection.
     "crypto_https_proxy": None,
     # Max quote currency (USDT) to spend on a single BUY. Caps risk per signal.
-    "crypto_quote_budget": 1000.0,
+    "crypto_quote_budget": 5000.0,
     # Max fraction of total account equity to hold in a single base asset
     # (e.g. 0.2 = 20% in BTC). Sell orders are unaffected.
     "crypto_max_position": 0.2,
     # Minimum seconds between orders on the same symbol. Guards against the
     # non-deterministic LLM re-issuing the same signal within a session.
-    "crypto_cooldown_seconds": 14400,  # 4 hours
+    # ``crypto_cooldown_seconds`` is the legacy single-value knob (seeds both
+    # directions for backward compatibility); prefer the direction-aware pair
+    # below. Buy cooldown stays long (avoid doubling up on a signal); sell
+    # cooldown is short so exits (take-profit / stop-loss) are never blocked
+    # by a stale "just bought" stamp.
+    "crypto_cooldown_seconds": 14400,  # 4 hours (legacy fallback)
+    "crypto_buy_cooldown_seconds": 14400,   # 4 hours between buys on a symbol
+    "crypto_sell_cooldown_seconds": 3600,   # 1 hour between sells on a symbol
+    # Code-level hard stop-loss: when a held position drops this many percent
+    # below its last filled BUY price, the runner force-sells at market
+    # regardless of what the LLM decides. 0 disables the check. This is a
+    # deterministic safety net that cannot be talked out of by the PM.
+    "crypto_stop_loss_pct": 10.0,
 
     # --- Autonomous runner (optional, OFF by default) ---
     # Wraps propagate() in a scheduled loop. When enabled, the runner takes a
@@ -224,14 +257,16 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "runner_enabled": False,
     # Seconds between the start of consecutive cycles. The LLM analysis itself
     # can take several minutes, so the effective cadence is max(interval,
-    # analysis_runtime). 3600s = 1 hour is a reasonable default for crypto.
-    "runner_interval_seconds": 3600,
+    # analysis_runtime). The PM's decision horizon is multi-day (daily OHLCV
+    # confirmation), so 4 hours per cycle is enough to catch signals without
+    # re-running the same daily setup every hour. 14400s = 4 hours.
+    "runner_interval_seconds": 14400,
     # Hard cap on total cycles across all tickers. 0 = run forever (until
     # interrupted). Useful for "run 3 cycles then stop" smoke tests.
     "runner_max_cycles": 0,
     # Comma-separated tickers to analyze each cycle, e.g. "BTC-USD,ETH-USD".
     # Each ticker is analyzed sequentially within a cycle.
-    "runner_tickers": "BTC-USD",
+    "runner_tickers": "BTC-USD,ETH-USD,SOL-USD",
     # SQLite path for the runner state store. None = default under
     # data_cache_dir/runner_state.db.
     "runner_db_path": None,
@@ -243,4 +278,10 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # Minimum age (hours) a trade must reach before it's eligible for
     # reflection. Prevents reflecting on a trade seconds after it fills.
     "runner_reflect_min_age_hours": 1.0,
+    # Reflect on HOLD (no-trade) decisions every N cycles (0 = never).
+    # Unlike trade reflection, this reviews decisions that did NOT result in
+    # an order — "did my HOLD age well?" — so the system keeps learning even
+    # during idle stretches where nothing fills. 6 cycles at a 4h cadence ≈
+    # once per day.
+    "runner_reflect_hold_every_n_cycles": 6,
 })

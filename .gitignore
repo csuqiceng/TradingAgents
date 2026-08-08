@@ -221,3 +221,6 @@ __marimo__/
 # Enterprise env file (secrets) and generated run reports
 .env.enterprise
 reports/
+
+# 本地环境变量备份（含密钥，禁止入库）
+.env.bak-*

@@ -91,7 +91,9 @@ class CryptoBroker(BaseBroker):
         testnet: bool = True,
         quote_budget: float = 1000.0,
         max_position_fraction: float = 0.2,
-        cooldown_seconds: float = 14400.0,
+        cooldown_seconds: float | None = None,
+        buy_cooldown_seconds: float | None = None,
+        sell_cooldown_seconds: float | None = None,
         cooldown_state_path: str | None = None,
         passphrase: str | None = None,
         https_proxy: str | None = None,
@@ -142,7 +144,15 @@ class CryptoBroker(BaseBroker):
         self.quote_budget = float(quote_budget)
         self.max_position_fraction = float(max_position_fraction)
         self.cooldown = CooldownGuard(cooldown_state_path)
-        self.cooldown_seconds = float(cooldown_seconds)
+        # Direction-aware cooldowns. ``cooldown_seconds`` is kept as a
+        # backwards-compatible fallback for callers that only pass the old
+        # single-value knob (it seeds both directions).
+        if buy_cooldown_seconds is None:
+            buy_cooldown_seconds = cooldown_seconds
+        if sell_cooldown_seconds is None:
+            sell_cooldown_seconds = cooldown_seconds
+        self.buy_cooldown_seconds = float(buy_cooldown_seconds or 0)
+        self.sell_cooldown_seconds = float(sell_cooldown_seconds or 0)
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -173,14 +183,18 @@ class CryptoBroker(BaseBroker):
                 symbol=ccxt_symbol,
             )
 
-        # --- Guard 1: cooldown ------------------------------------------- #
-        allowed, remaining = self.cooldown.can_trade(ccxt_symbol, self.cooldown_seconds)
+        # --- Guard 1: cooldown (direction-aware) ------------------------- #
+        cooldown = (
+            self.buy_cooldown_seconds if action == "BUY" else self.sell_cooldown_seconds
+        )
+        direction = "buy" if action == "BUY" else "sell"
+        allowed, remaining = self.cooldown.can_trade(ccxt_symbol, cooldown, direction=direction)
         if not allowed:
             return OrderResult(
                 status="skipped",
                 reason=(
-                    f"cooldown active on {ccxt_symbol}: "
-                    f"{remaining:.0f}s remaining of {self.cooldown_seconds:.0f}s"
+                    f"cooldown active on {ccxt_symbol} ({direction}): "
+                    f"{remaining:.0f}s remaining of {cooldown:.0f}s"
                 ),
                 action=action,
                 symbol=ccxt_symbol,
@@ -261,17 +275,21 @@ class CryptoBroker(BaseBroker):
             )
 
         order = self.exchange.create_order(ccxt_symbol, "market", "buy", amount)
-        self.cooldown.record(ccxt_symbol)
+        self.cooldown.record(ccxt_symbol, direction="buy")
+        # Use the exchange-reported average fill price when available: the
+        # ticker price is a quote, the market order may fill worse in a fast
+        # market, and the recorded price anchors the hard stop-loss.
+        fill_price = float(order.get("average") or price)
         logger.info(
             "BUY filled: %s %s @ ~%s (id=%s)",
-            amount, ccxt_symbol, price, order.get("id"),
+            amount, ccxt_symbol, fill_price, order.get("id"),
         )
         return OrderResult(
             status="filled",
             order=order,
             action="BUY",
             symbol=ccxt_symbol,
-            price=price,
+            price=fill_price,
             amount=amount,
         )
 
@@ -299,19 +317,53 @@ class CryptoBroker(BaseBroker):
                 symbol=ccxt_symbol,
             )
         order = self.exchange.create_order(ccxt_symbol, "market", "sell", amount)
-        self.cooldown.record(ccxt_symbol)
+        self.cooldown.record(ccxt_symbol, direction="sell")
+        fill_price = float(order.get("average") or price)
         logger.info(
             "SELL filled: %s %s @ ~%s (id=%s)",
-            amount, ccxt_symbol, price, order.get("id"),
+            amount, ccxt_symbol, fill_price, order.get("id"),
         )
         return OrderResult(
             status="filled",
             order=order,
             action="SELL",
             symbol=ccxt_symbol,
-            price=price,
+            price=fill_price,
             amount=amount,
         )
+
+    def hard_stop_sell(self, symbol: str) -> OrderResult:
+        """Emergency exit: sell the full free position at market, bypassing
+        cooldowns and the position-cap guard.
+
+        Used by the autonomous runner's code-level stop-loss check. Cooldowns
+        are deliberately skipped here — a hard stop exists to protect capital,
+        not to respect trading cadence. The caller is responsible for recording
+        a cooldown afterwards if it wants to prevent an immediate re-entry.
+
+        Returns an :class:`OrderResult`; routine rejections (no position,
+        dust amount) return ``status="skipped"`` and never raise.
+        """
+        ccxt_symbol = to_ccxt_symbol(symbol)
+        try:
+            price = self._fetch_price(ccxt_symbol)
+            balance = self._fetch_balance()
+            result = self._sell(ccxt_symbol, price, balance)
+            if result.get("status") == "filled":
+                logger.warning(
+                    "HARD STOP-LOSS SELL filled: %s %s @ ~%s (id=%s)",
+                    result.get("amount"), ccxt_symbol, result.get("price"),
+                    (result.get("order") or {}).get("id"),
+                )
+            return result
+        except Exception as exc:
+            logger.error("Hard stop-loss sell failed on %s: %s", ccxt_symbol, exc)
+            return OrderResult(
+                status="error",
+                reason=str(exc),
+                action="SELL",
+                symbol=ccxt_symbol,
+            )
 
     # ------------------------------------------------------------------ #
     # Exchange data accessors — isolated so tests can stub them.

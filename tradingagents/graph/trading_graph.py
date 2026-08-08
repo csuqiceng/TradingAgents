@@ -425,6 +425,46 @@ class TradingAgentsGraph:
         # deterministically resolved instrument identity for all agents.
         past_context = self.memory_log.get_past_context(company_name)
         instrument_context = self.resolve_instrument_context(company_name, asset_type)
+
+        # When crypto execution is live, anchor the PM to the *executable*
+        # price: yfinance OHLCV data (daily candles, possibly stale) drives the
+        # analysis, but the broker fills at the current OKX spot price. Inject
+        # the live quote so the PM weighs "what I can actually trade at" — the
+        # two can diverge meaningfully in fast markets and the decision should
+        # not be priced on a candle that no longer exists.
+        if self.config.get("execution_enabled") and asset_type == "crypto":
+            try:
+                from tradingagents.execution import CryptoBroker
+                from tradingagents.execution.crypto_broker import to_ccxt_symbol
+
+                broker = CryptoBroker(
+                    exchange_id=self.config.get("crypto_exchange", "binance"),
+                    api_key=self.config.get("crypto_api_key"),
+                    secret=self.config.get("crypto_secret"),
+                    testnet=self.config.get("execution_mode", "paper") == "paper",
+                    quote_budget=self.config.get("crypto_quote_budget", 5000.0),
+                    max_position_fraction=self.config.get("crypto_max_position", 0.2),
+                    cooldown_seconds=self.config.get("crypto_cooldown_seconds"),
+                    buy_cooldown_seconds=self.config.get("crypto_buy_cooldown_seconds"),
+                    sell_cooldown_seconds=self.config.get("crypto_sell_cooldown_seconds"),
+                    passphrase=self.config.get("crypto_passphrase"),
+                    https_proxy=self.config.get("crypto_https_proxy"),
+                )
+                live_price = broker._fetch_price(to_ccxt_symbol(company_name))
+                exchange_name = self.config.get("crypto_exchange", "binance")
+                live_note = (
+                    f"**Live spot price right now on {exchange_name.upper()} "
+                    f"({to_ccxt_symbol(company_name)}): {live_price:,.2f} USDT.** "
+                    "This is the executable price. yfinance OHLCV data above may "
+                    "lag or differ from it; weigh the live price heavily when "
+                    "deciding entry/exit timing."
+                )
+                past_context = (
+                    f"{past_context}\n\n{live_note}" if past_context else live_note
+                )
+            except Exception as exc:
+                logger.warning("could not fetch live price for decision context: %s", exc)
+
         init_agent_state = self.propagator.create_initial_state(
             company_name,
             trade_date,
@@ -580,9 +620,11 @@ class TradingAgentsGraph:
             api_key=self.config.get("crypto_api_key"),
             secret=self.config.get("crypto_secret"),
             testnet=self.config.get("execution_mode", "paper") == "paper",
-            quote_budget=self.config.get("crypto_quote_budget", 1000.0),
+            quote_budget=self.config.get("crypto_quote_budget", 5000.0),
             max_position_fraction=self.config.get("crypto_max_position", 0.2),
-            cooldown_seconds=self.config.get("crypto_cooldown_seconds", 14400.0),
+            cooldown_seconds=self.config.get("crypto_cooldown_seconds"),
+            buy_cooldown_seconds=self.config.get("crypto_buy_cooldown_seconds"),
+            sell_cooldown_seconds=self.config.get("crypto_sell_cooldown_seconds"),
             passphrase=self.config.get("crypto_passphrase"),
             https_proxy=self.config.get("crypto_https_proxy"),
         )

@@ -100,9 +100,11 @@ class TradingLoop:
                 passphrase=self.config.get("crypto_passphrase"),
                 https_proxy=self.config.get("crypto_https_proxy"),
                 testnet=self.config.get("execution_mode", "paper") == "paper",
-                quote_budget=self.config.get("crypto_quote_budget", 1000.0),
+                quote_budget=self.config.get("crypto_quote_budget", 5000.0),
                 max_position_fraction=self.config.get("crypto_max_position", 0.2),
-                cooldown_seconds=self.config.get("crypto_cooldown_seconds", 14400.0),
+                cooldown_seconds=self.config.get("crypto_cooldown_seconds"),
+                buy_cooldown_seconds=self.config.get("crypto_buy_cooldown_seconds"),
+                sell_cooldown_seconds=self.config.get("crypto_sell_cooldown_seconds"),
             )
         return self._broker
 
@@ -195,8 +197,44 @@ class TradingLoop:
         except Exception as exc:
             logger.warning("pre-cycle snapshot failed: %s", exc)
 
-        cycle_id = self.store.start_cycle(ticker, trade_date, equity_before)
+        # Anchor price for this cycle — the live spot price at decision time,
+        # stored so hold-decision reflection can measure "how did the market
+        # move since I chose not to trade?".
+        price_at_decision = None
+        try:
+            if _is_crypto(ticker):
+                price_at_decision = self.get_broker()._fetch_price(to_ccxt_symbol(ticker))
+        except Exception as exc:
+            logger.warning("price anchor fetch failed for %s: %s", ticker, exc)
+
+        cycle_id = self.store.start_cycle(ticker, trade_date, equity_before, price_at_decision)
         logger.info("=== cycle %d: %s @ %s (%s) ===", cycle_id, ticker, trade_date, asset_type)
+
+        # 1b. Code-level hard stop-loss check, before the LLM runs. This is a
+        # deterministic safety net: if a position is down more than
+        # crypto_stop_loss_pct from its entry, force-sell at market now.
+        # The order is recorded as its own audit row; the LLM analysis below
+        # still runs (its BUY would be blocked by the buy cooldown we stamp).
+        stop_result = None
+        try:
+            stop_result = self._check_stop_loss(ticker)
+        except Exception as exc:
+            logger.error("stop-loss check failed: %s", exc)
+        if stop_result is not None:
+            self.store.record_order(
+                cycle_id=cycle_id,
+                symbol=stop_result.get("symbol"),
+                action=stop_result.get("action", "SELL"),
+                status=stop_result.get("status", "error"),
+                rating=None,
+                price=stop_result.get("price"),
+                amount=stop_result.get("amount"),
+                reason=stop_result.get("reason") or "hard stop-loss",
+                exchange_order_id=(stop_result.get("order") or {}).get("id"),
+                raw=stop_result,
+            )
+            logger.warning("stop-loss order recorded for cycle %d: %s",
+                           cycle_id, stop_result.get("status"))
 
         rating: str | None = None
         order_status: str | None = None
@@ -302,6 +340,7 @@ class TradingLoop:
         )
         reflect_every = int(self.config.get("runner_reflect_every_n_cycles", 0) or 0)
         reflect_min_age = float(self.config.get("runner_reflect_min_age_hours", 1.0) or 1.0)
+        reflect_hold_every = int(self.config.get("runner_reflect_hold_every_n_cycles", 0) or 0)
         cycle_count = 0
         try:
             while True:
@@ -322,6 +361,17 @@ class TradingLoop:
                         self.reflect_on_trades(min_age_hours=reflect_min_age)
                     except Exception as exc:
                         logger.error("auto-reflection failed: %s", exc)
+
+                # Periodically reflect on HOLD decisions too: when nothing
+                # fills, the only feedback is the price path after a no-trade
+                # call. Reviewing those keeps the system learning during idle
+                # stretches instead of only after fills.
+                if reflect_hold_every and cycle_count % reflect_hold_every == 0:
+                    logger.info("auto-reflecting on HOLD decisions (cycle %d)", cycle_count)
+                    try:
+                        self.reflect_on_decisions(min_age_hours=reflect_min_age)
+                    except Exception as exc:
+                        logger.error("hold-reflection failed: %s", exc)
 
                 if self.max_cycles and cycle_count >= self.max_cycles:
                     return
@@ -356,6 +406,68 @@ class TradingLoop:
             "recent_orders": self.store.list_orders(limit=10),
             "recent_reflections": self.store.list_reflections(limit=5),
         }
+
+    # ------------------------------------------------------------------ #
+    # Hard stop-loss — deterministic capital protection
+    # ------------------------------------------------------------------ #
+
+    def _check_stop_loss(self, ticker: str) -> dict[str, Any] | None:
+        """Code-level hard stop-loss check for ``ticker``.
+
+        If the runner holds a position on ``ticker`` and the current price is
+        more than ``crypto_stop_loss_pct`` below the last filled BUY price,
+        force-sell the entire free position at market — regardless of what the
+        LLM would decide. This is the one guard that cannot be argued out of:
+        it lives in code, runs every cycle *before* the analysis, and does not
+        consult the PM.
+
+        Returns the OrderResult dict when a stop was triggered (filled or
+        error), else None. Errors are logged and swallowed — a stop-loss
+        outage must not crash the cycle.
+        """
+        stop_pct = float(self.config.get("crypto_stop_loss_pct", 0) or 0)
+        if stop_pct <= 0:
+            return None
+        if not self.config.get("execution_enabled"):
+            return None
+
+        broker = self.get_broker()
+        try:
+            pos = broker.get_position(ticker)
+        except Exception as exc:
+            logger.warning("stop-loss check: position fetch failed for %s: %s", ticker, exc)
+            return None
+        if "error" in pos:
+            return None
+
+        total = float(pos.get("total") or 0)
+        if total <= 0:
+            return None  # nothing held — nothing to protect
+
+        entry = self.store.get_last_filled_buy_price(to_ccxt_symbol(ticker))
+        if not entry or entry <= 0:
+            return None  # no tracked entry price (e.g. manual position) — stay dormant
+
+        current = float(pos.get("price") or 0)
+        if current <= 0:
+            return None
+
+        drawdown_pct = (current - entry) / entry * 100
+        if drawdown_pct > -stop_pct:
+            return None  # not breached
+
+        logger.warning(
+            "HARD STOP-LOSS triggered for %s: entry=%.2f current=%.2f (%.2f%%), threshold=%.1f%%",
+            to_ccxt_symbol(ticker), entry, current, drawdown_pct, -stop_pct,
+        )
+        result = broker.hard_stop_sell(ticker)
+        # Stamp the buy cooldown so the PM cannot re-buy the same symbol
+        # immediately after a stop-out (prevents "sell low, buy back" churn).
+        try:
+            broker.cooldown.record(to_ccxt_symbol(ticker), direction="buy")
+        except Exception:
+            pass
+        return dict(result)
 
     # ------------------------------------------------------------------ #
     # Trade reflection — the "learn from actual trades" layer
@@ -517,6 +629,132 @@ class TradingLoop:
             logger.warning("can't build LLM for reflection: %s", exc)
             return None
 
+    # ------------------------------------------------------------------ #
+    # Hold-decision reflection — learning from the trades we did NOT make
+    # ------------------------------------------------------------------ #
+
+    _HOLD_REFLECTION_PROMPT = (
+        "You are a trading agent reviewing a decision to NOT trade (HOLD), "
+        "now that some time has passed and the price path is known.\n"
+        "Write 3-5 sentences of plain prose (no bullets, no headers, no markdown).\n\n"
+        "Cover in order:\n"
+        "1. Was staying out the right call? (cite the price move since the decision)\n"
+        "2. Did the market move the way the original analysis anticipated, or surprise it?\n"
+        "3. Which part of the original reasoning aged well, and which part aged poorly?\n"
+        "4. One concrete, actionable rule for the next decision on this asset.\n\n"
+        "Be specific and honest. Your output will be stored and re-read by "
+        "future analysis runs, so every word must earn its place."
+    )
+
+    def reflect_on_decisions(self, min_age_hours: float = 24, max_decisions: int = 6) -> list[dict[str, Any]]:
+        """Review HOLD decisions that never produced an order.
+
+        When nothing fills, the only feedback signal is the price path after a
+        no-trade call. For each unreflected HOLD cycle:
+          1. Fetch the current price from the exchange.
+          2. Compute the price move since the decision (anchored by the
+             cycle's ``price_at_decision``).
+          3. Call the LLM to assess whether the HOLD aged well + one lesson.
+          4. Store in trade_reflections (action='HOLD') and append the lesson
+             to the memory log so future PM runs can read it via
+             get_past_context().
+
+        Returns the list of reflection summaries.
+        """
+        broker = self.get_broker()
+        pending = self.store.get_hold_decisions_for_reflection(
+            min_age_hours=min_age_hours, limit=max_decisions
+        )
+        if not pending:
+            logger.info("reflect_on_decisions: no HOLD decisions to review")
+            return []
+
+        llm = self._get_reflection_llm()
+        results: list[dict[str, Any]] = []
+        for dec in pending:
+            ticker = dec.get("ticker") or ""
+            sym = to_ccxt_symbol(ticker)
+            anchor = dec.get("price_at_decision")
+            try:
+                current_price = broker._fetch_price(sym)
+            except Exception as exc:
+                logger.warning("reflect: can't fetch price for %s: %s", sym, exc)
+                current_price = None
+
+            move_pct = None
+            if anchor and current_price:
+                move_pct = (current_price - anchor) / anchor * 100
+
+            reflection_text = "(LLM unavailable — reflection skipped)"
+            lessons = None
+            if llm is not None:
+                try:
+                    move_desc = "unknown"
+                    if move_pct is not None:
+                        move_desc = f"{move_pct:+.2f}%"
+                    price_desc = f"{current_price:,.2f}" if current_price is not None else "unknown"
+                    age_hours = (time.time() - float(dec.get("cycle_ts", time.time()))) / 3600
+                    prompt_body = (
+                        f"Decision: HOLD on {ticker} (no order placed)\n"
+                        f"Price at decision: {anchor}\n"
+                        f"Current price: {price_desc}\n"
+                        f"Price move since decision: {move_desc}\n"
+                        f"Decision age (hours): {age_hours:.1f}\n\n"
+                        f"Original decision text:\n{dec.get('decision_md') or '(not recorded)'}"
+                    )
+                    from langchain_core.messages import HumanMessage, SystemMessage
+                    msg = llm.invoke([
+                        SystemMessage(content=self._HOLD_REFLECTION_PROMPT),
+                        HumanMessage(content=prompt_body),
+                    ])
+                    reflection_text = msg.content if hasattr(msg, "content") else str(msg)
+                    # Extract the last sentence as the "lesson" for quick injection.
+                    sentences = [s.strip() for s in reflection_text.split(".") if s.strip()]
+                    lessons = sentences[-1] + "." if sentences else reflection_text
+                except Exception as exc:
+                    logger.error("reflect: LLM call failed: %s", exc)
+                    reflection_text = f"(LLM reflection failed: {exc})"
+
+            self.store.record_reflection(
+                order_id=None,
+                cycle_id=dec.get("cycle_id"),
+                ticker=ticker,
+                action="HOLD",
+                rating=dec.get("rating") or "Hold",
+                entry_price=anchor,
+                current_price=current_price,
+                amount=None,
+                pnl_quote=None,
+                pnl_pct=move_pct,
+                holding_hours=(time.time() - float(dec.get("cycle_ts", time.time()))) / 3600,
+                decision_md=dec.get("decision_md"),
+                reflection_text=reflection_text,
+                lessons=lessons,
+            )
+            self._append_trade_lesson_to_memory(
+                ticker=ticker, action="HOLD", sym=sym, pnl_pct=move_pct,
+                lessons=lessons or reflection_text,
+            )
+
+            summary = {
+                "cycle_id": dec.get("cycle_id"),
+                "ticker": ticker,
+                "action": "HOLD",
+                "price_at_decision": anchor,
+                "current_price": current_price,
+                "move_pct": move_pct,
+                "reflection": reflection_text[:120] + "..." if len(reflection_text) > 120 else reflection_text,
+            }
+            results.append(summary)
+            move_str = f"{move_pct:+.2f}%" if move_pct is not None else "n/a"
+            print(
+                f"[hold-reflection] cycle={dec.get('cycle_id')} {ticker} "
+                f"anchor={anchor} now={current_price} move={move_str}",
+                flush=True,
+            )
+
+        return results
+
     def _append_trade_lesson_to_memory(
         self, ticker: str, action: str, sym: str, pnl_pct: float | None, lessons: str
     ) -> None:
@@ -534,7 +772,10 @@ class TradingLoop:
             log_path.parent.mkdir(parents=True, exist_ok=True)
 
             pnl_str = f"{pnl_pct:+.1f}%" if pnl_pct is not None else "n/a"
-            tag = f"[{dt.date.today().isoformat()} | {ticker} | TRADE:{action} | {pnl_str} | 0% | 0d]"
+            # BUY/SELL get a TRADE: prefix; HOLD decisions are tagged with the
+            # plain rating so the memory parser's rating field stays clean.
+            label = f"TRADE:{action}" if action in ("BUY", "SELL") else action
+            tag = f"[{dt.date.today().isoformat()} | {ticker} | {label} | {pnl_str} | 0% | 0d]"
             entry = (
                 f"{tag}\n\n"
                 f"DECISION:\n(Trade reflection: {action} {sym}, PnL {pnl_str})\n\n"

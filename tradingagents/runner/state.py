@@ -109,6 +109,10 @@ _MIGRATIONS = [
     # Add decision_md to cycles (stores the full PM decision markdown so
     # reflection can review "what did I think" alongside "what happened").
     "ALTER TABLE cycles ADD COLUMN decision_md TEXT",
+    # Add price_at_decision to cycles: the live spot price at cycle start,
+    # used by hold-decision reflection to evaluate "did the market move
+    # against/for my HOLD since I decided?".
+    "ALTER TABLE cycles ADD COLUMN price_at_decision REAL",
 ]
 
 
@@ -250,14 +254,26 @@ class RunnerStateStore:
     # Cycles
     # ------------------------------------------------------------------ #
 
-    def start_cycle(self, ticker: str, trade_date: str, equity_before: float | None = None) -> int:
-        """Insert a cycle row in 'running' state. Returns its rowid."""
+    def start_cycle(
+        self,
+        ticker: str,
+        trade_date: str,
+        equity_before: float | None = None,
+        price_at_decision: float | None = None,
+    ) -> int:
+        """Insert a cycle row in 'running' state. Returns its rowid.
+
+        ``price_at_decision`` is the live spot price when the cycle started;
+        it anchors hold-decision reflection (price move since the decision).
+        """
         cur = self._conn.execute(
             """
-            INSERT INTO cycles (ts, ticker, trade_date, status, equity_before, started_at)
-            VALUES (?, ?, ?, 'running', ?, ?)
+            INSERT INTO cycles (ts, ticker, trade_date, status, equity_before,
+                                started_at, price_at_decision)
+            VALUES (?, ?, ?, 'running', ?, ?, ?)
             """,
-            (time.time(), ticker, trade_date, equity_before, time.time()),
+            (time.time(), ticker, trade_date, equity_before, time.time(),
+             price_at_decision),
         )
         self._conn.commit()
         return cur.lastrowid
@@ -369,6 +385,73 @@ class RunnerStateStore:
             ORDER BY o.ts ASC
             """,
             (cutoff,),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+    def get_last_filled_buy_price(self, symbol: str) -> float | None:
+        """Return the fill price of the most recent filled BUY on ``symbol``.
+
+        Used by the hard stop-loss check to anchor the entry price. Returns
+        None when there is no filled buy on record (e.g. a position opened
+        manually outside the runner) — the stop-loss then stays dormant
+        rather than guessing an entry.
+        """
+        cur = self._conn.execute(
+            """
+            SELECT price FROM orders
+            WHERE symbol = ? AND action = 'BUY' AND status = 'filled'
+              AND price IS NOT NULL
+            ORDER BY ts DESC LIMIT 1
+            """,
+            (symbol,),
+        )
+        row = cur.fetchone()
+        return float(row[0]) if row else None
+
+    def get_hold_decisions_for_reflection(
+        self, min_age_hours: float = 0, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        """Return completed HOLD cycles not yet reflected on.
+
+        This is the input set for ``TradingLoop.reflect_on_decisions()`` —
+        the "did my no-trade call age well?" review.
+
+        Only *genuine* HOLD decisions qualify, so the review never fabricates
+        a "no-trade" narrative for a cycle that actually wanted to trade:
+          - ``c.rating = 'Hold'`` excludes cycles whose PM said BUY/SELL but
+            got blocked by cooldown / position cap (those are "wanted to
+            trade, couldn't", not "decided not to trade").
+          - ``NOT EXISTS filled order`` excludes cycles where a hard
+            stop-loss actually sold (those are already reviewed as real
+            trades by ``reflect_on_trades`` — double-reviewing them as HOLD
+            would write contradictory lessons).
+        A cycle counts as unreflected when no trade_reflections row references
+        it with action='HOLD'. Joined with the live anchor price captured at
+        cycle start (``price_at_decision``).
+        """
+        cutoff = time.time() - min_age_hours * 3600
+        cur = self._conn.execute(
+            """
+            SELECT c.id AS cycle_id, c.ts AS cycle_ts, c.ticker, c.trade_date,
+                   c.decision_md, c.price_at_decision, c.rating
+            FROM cycles c
+            WHERE c.status = 'completed'
+              AND c.rating = 'Hold'
+              AND c.decision_md IS NOT NULL
+              AND c.ts <= ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM orders o
+                  WHERE o.cycle_id = c.id AND o.status = 'filled'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM trade_reflections r
+                  WHERE r.cycle_id = c.id AND r.action = 'HOLD'
+              )
+            ORDER BY c.ts ASC
+            LIMIT ?
+            """,
+            (cutoff, limit),
         )
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, r)) for r in cur.fetchall()]

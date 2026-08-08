@@ -163,15 +163,34 @@ class TestCooldownGuard:
     def test_allows_after_window_expires(self, tmp_path):
         path = tmp_path / "cooldowns.json"
         guard = CooldownGuard(path)
-        # Manually backdate the last order past the cooldown.
+        # Manually backdate the last order past the cooldown. The state key is
+        # direction-qualified ("SYMBOL#buy"); backdate that exact key.
         guard.record("BTC/USDT")
         import time as _time
         state = guard._load()
-        state["BTC/USDT"] = _time.time() - 4000
+        state["BTC/USDT#buy"] = _time.time() - 4000
         guard._dump(state)
         allowed, remaining = guard.can_trade("BTC/USDT", 3600)
         assert allowed is True
         assert remaining is None
+
+    def test_directions_are_independent(self, tmp_path):
+        """A fresh SELL must not be blocked by a recent BUY, and vice versa."""
+        path = tmp_path / "cooldowns.json"
+        guard = CooldownGuard(path)
+        guard.record("BTC/USDT", direction="buy")
+        # Buy is cooling down...
+        allowed, _ = guard.can_trade("BTC/USDT", 3600, direction="buy")
+        assert allowed is False
+        # ...but a sell (e.g. stop-loss exit) is still allowed.
+        allowed, _ = guard.can_trade("BTC/USDT", 3600, direction="sell")
+        assert allowed is True
+        guard.record("BTC/USDT", direction="sell")
+        allowed, _ = guard.can_trade("BTC/USDT", 3600, direction="sell")
+        assert allowed is False
+        # And the buy cooldown is untouched by the sell.
+        allowed, _ = guard.can_trade("BTC/USDT", 3600, direction="buy")
+        assert allowed is False
 
     def test_independent_symbols_do_not_block_each_other(self, tmp_path):
         guard = CooldownGuard(tmp_path / "cooldowns.json")
@@ -331,3 +350,44 @@ class TestBrokerPlaceOrder:
         result = broker.place_order("BTC-USD", _decision(PortfolioRating.UNDERWEIGHT))
         assert result["status"] == "filled"
         assert result["action"] == "SELL"
+
+    def test_sell_not_blocked_by_buy_cooldown(self, tmp_path):
+        """Direction-aware cooldown: a fresh BUY must not block a SELL exit."""
+        exchange = FakeExchange(
+            price=50000.0,
+            balances={
+                "USDT": {"free": 50000.0, "total": 50000.0},
+                "BTC": {"free": 0.1, "total": 0.1},
+            },
+        )
+        broker = self._broker(tmp_path, exchange=exchange, cooldown_seconds=3600)
+        buy = broker.place_order("BTC-USD", _decision(PortfolioRating.BUY))
+        assert buy["status"] == "filled"
+        # Buy cooldown is now active, but a sell on the same symbol passes.
+        sell = broker.place_order("BTC-USD", _decision(PortfolioRating.SELL))
+        assert sell["status"] == "filled"
+        assert sell["action"] == "SELL"
+
+    def test_hard_stop_sell_bypasses_cooldown(self, tmp_path):
+        """hard_stop_sell exits even when a cooldown is active (capital first)."""
+        exchange = FakeExchange(
+            price=45000.0,
+            balances={
+                "USDT": {"free": 0.0, "total": 0.0},
+                "BTC": {"free": 0.1, "total": 0.1},
+            },
+        )
+        broker = self._broker(tmp_path, exchange=exchange, cooldown_seconds=3600)
+        # Simulate a recent order so a cooldown is definitely active.
+        broker.cooldown.record("BTC/USDT", direction="sell")
+        result = broker.hard_stop_sell("BTC-USD")
+        assert result["status"] == "filled"
+        assert result["action"] == "SELL"
+        assert exchange.created_orders[0]["side"] == "sell"
+
+    def test_hard_stop_sell_skipped_without_position(self, tmp_path):
+        exchange = FakeExchange(price=45000.0, balances={"USDT": {"free": 5000.0, "total": 5000.0}})
+        broker = self._broker(tmp_path, exchange=exchange)
+        result = broker.hard_stop_sell("BTC-USD")
+        assert result["status"] == "skipped"
+        assert "no BTC position" in result["reason"]
