@@ -387,6 +387,10 @@ def _run_once_loop(store, broker, *, daily_limit=-0.10, drawdown_limit=-0.15,
     real — with a zero-position broker it returns None, exercising the real
     path without triggering. Callers that want a stop-loss use a positioned
     broker plus a seeded BUY order.
+
+    The halt-reflection LLM is stubbed to None (skip LLM prose) by default so
+    halt-path tests don't try to build a real LLM client. Tests that exercise
+    the reflection logic should override ``loop._get_reflection_llm``.
     """
     loop = TradingLoop({
         "runner_daily_loss_limit": daily_limit,
@@ -397,13 +401,25 @@ def _run_once_loop(store, broker, *, daily_limit=-0.10, drawdown_limit=-0.15,
     loop.store = store
     loop.snapshot_account = lambda: {"equity_quote": equity_quote}
     loop.get_broker = lambda: broker
+    # B1: stub the reflection LLM to None so halt-reflection records the event
+    # without calling a real LLM. This also ensures _graph_must_not_run's
+    # invariant (no graph construction on halt) is genuinely tested —
+    # previously get_graph was called via _get_reflection_llm but the
+    # AssertionError was silently swallowed.
+    loop._get_reflection_llm = lambda: None
     return loop
 
 
 def _graph_must_not_run():
     """Stand-in for get_graph on halt-path tests: if run_once fails to
-    short-circuit, calling get_graph raises instead of silently building the
-    heavy graph."""
+    short-circuit (i.e. the halt branch doesn't return early), calling
+    get_graph raises instead of silently building the heavy graph.
+
+    Note: the halt-reflection LLM is stubbed separately via
+    ``loop._get_reflection_llm = lambda: None`` in _run_once_loop. This guard
+    catches the case where the halt branch falls through to the propagate()
+    call below it — it does NOT guard against _reflect_on_halt (which now uses
+    a lightweight LLM, not the full graph)."""
     raise AssertionError("get_graph/propagate must not run on a halted cycle")
 
 
@@ -635,3 +651,389 @@ class TestRunForeverGuardrailHalt:
             loop.run_forever()
 
         assert loop.run_once.call_count == 2
+
+
+# ======================================================================
+# B1: Halt-reflection tests (_reflect_on_halt + halt_events table)
+# ======================================================================
+
+class TestHaltEventsTable:
+    """Tests for the halt_events table CRUD in RunnerStateStore."""
+
+    def test_record_and_list_halt_event(self):
+        store = _make_store()
+        rowid = store.record_halt_event(
+            cycle_id=42, ticker="BTC-USD", reason="daily_loss_limit",
+            equity_before=4450.0,
+            analysis_text="Strategy failed due to sudden drop.",
+            lessons="Reduce position size during high volatility.",
+        )
+        assert isinstance(rowid, int)
+        events = store.list_halt_events(limit=10)
+        assert len(events) == 1
+        e = events[0]
+        assert e["cycle_id"] == 42
+        assert e["ticker"] == "BTC-USD"
+        assert e["reason"] == "daily_loss_limit"
+        assert e["equity_before"] == 4450.0
+        assert "Strategy failed" in e["analysis_text"]
+        assert "Reduce position" in e["lessons"]
+
+    def test_list_halt_events_orders_by_ts_desc(self):
+        store = _make_store()
+        id1 = store.record_halt_event(cycle_id=1, ticker="BTC-USD",
+                                       reason="daily_loss_limit", equity_before=4000.0)
+        time.sleep(0.01)
+        id2 = store.record_halt_event(cycle_id=2, ticker="ETH-USD",
+                                       reason="max_drawdown", equity_before=3000.0)
+        events = store.list_halt_events(limit=10)
+        assert events[0]["id"] == id2  # most recent first
+        assert events[1]["id"] == id1
+
+    def test_record_halt_event_with_null_fields(self):
+        store = _make_store()
+        store.record_halt_event(
+            cycle_id=1, ticker=None, reason="max_drawdown",
+            equity_before=None, analysis_text=None, lessons=None,
+        )
+        events = store.list_halt_events()
+        assert len(events) == 1
+        assert events[0]["ticker"] is None
+        assert events[0]["equity_before"] is None
+        assert events[0]["analysis_text"] is None
+        assert events[0]["lessons"] is None
+
+
+class TestReflectOnHalt:
+    """Unit tests for _reflect_on_halt: LLM available, LLM unavailable, cooldown,
+    lesson extraction, and memory log writing."""
+
+    def _make_halt_loop(self, store, equity_before=4450.0):
+        """Build a loop with a stubbed snapshot/broker for halt-reflection tests."""
+        broker = FakeBroker(price_quote=60000.0)
+        loop = TradingLoop({
+            "runner_daily_loss_limit": -0.10,
+            "runner_max_drawdown": -0.15,
+            "crypto_stop_loss_pct": 10.0,
+            "execution_enabled": True,
+            "memory_log_path": str(Path(tempfile.mkdtemp()) / "memory.md"),
+        })
+        loop.store = store
+        loop.snapshot_account = lambda: {"equity_quote": equity_before}
+        loop.get_broker = lambda: broker
+        return loop
+
+    def test_halt_reflection_with_llm_writes_analysis_and_lessons(self):
+        store = _make_store()
+        loop = self._make_halt_loop(store)
+
+        # Fake LLM that returns a multi-sentence analysis
+        fake_msg = SimpleNamespace(content=(
+            "The halt was triggered by a 11% daily loss exceeding the 10% limit. "
+            "Recent BUY orders at high prices contributed to the drawdown as the "
+            "market reversed sharply. This appears to be a market regime change "
+            "rather than a strategy failure. The actionable rule is to reduce "
+            "position size by 50% when daily volatility exceeds 5%."
+        ))
+        fake_llm = MagicMock()
+        fake_llm.invoke = MagicMock(return_value=fake_msg)
+        loop._get_reflection_llm = lambda: fake_llm
+
+        loop._reflect_on_halt(
+            cycle_id=1, ticker="BTC-USD",
+            halt_reason="daily_loss_limit", equity_before=4450.0,
+        )
+
+        events = store.list_halt_events()
+        assert len(events) == 1
+        e = events[0]
+        assert e["reason"] == "daily_loss_limit"
+        assert e["equity_before"] == 4450.0
+        assert "11% daily loss" in e["analysis_text"]
+        # Lesson should be the last sentence (with min length check)
+        assert "reduce position size" in e["lessons"].lower()
+
+    def test_halt_reflection_llm_unavailable_records_placeholder(self):
+        store = _make_store()
+        loop = self._make_halt_loop(store)
+        loop._get_reflection_llm = lambda: None  # LLM unavailable
+
+        loop._reflect_on_halt(
+            cycle_id=1, ticker="BTC-USD",
+            halt_reason="max_drawdown", equity_before=3000.0,
+        )
+
+        events = store.list_halt_events()
+        assert len(events) == 1
+        e = events[0]
+        assert e["analysis_text"] == "(LLM unavailable — analysis skipped)"
+        assert e["lessons"] is None
+
+    def test_halt_reflection_llm_failure_records_error(self):
+        store = _make_store()
+        loop = self._make_halt_loop(store)
+        fake_llm = MagicMock()
+        fake_llm.invoke = MagicMock(side_effect=RuntimeError("LLM timeout"))
+        loop._get_reflection_llm = lambda: fake_llm
+
+        loop._reflect_on_halt(
+            cycle_id=1, ticker="BTC-USD",
+            halt_reason="daily_loss_limit", equity_before=4450.0,
+        )
+
+        events = store.list_halt_events()
+        assert len(events) == 1
+        assert "LLM halt reflection failed" in events[0]["analysis_text"]
+        assert events[0]["lessons"] is None
+
+    def test_halt_reflection_cooldown_skips_llm(self):
+        store = _make_store()
+        loop = self._make_halt_loop(store)
+        loop.config["runner_halt_reflection_cooldown_seconds"] = 3600
+
+        fake_llm = MagicMock()
+        fake_llm.invoke = MagicMock(return_value=SimpleNamespace(content="Analysis."))
+        loop._get_reflection_llm = lambda: fake_llm
+
+        # First halt: runs LLM
+        loop._reflect_on_halt(cycle_id=1, ticker="BTC-USD",
+                              halt_reason="daily_loss_limit", equity_before=4450.0)
+        assert fake_llm.invoke.call_count == 1
+
+        # Second halt within cooldown: skips LLM
+        loop._reflect_on_halt(cycle_id=2, ticker="BTC-USD",
+                              halt_reason="daily_loss_limit", equity_before=4400.0)
+        assert fake_llm.invoke.call_count == 1  # still 1, not 2
+
+        # Second halt event still recorded (with cooldown note)
+        events = store.list_halt_events()
+        assert len(events) == 2
+        assert "cooldown" in events[0]["analysis_text"].lower()
+
+    def test_halt_reflection_lesson_extraction_handles_decimals(self):
+        """I1 regression: split('.') would mangle '1.5x' → '1' + '5x'.
+        The re.split approach should preserve it."""
+        store = _make_store()
+        loop = self._make_halt_loop(store)
+
+        fake_msg = SimpleNamespace(content=(
+            "The drawdown was caused by overleveraging at 1.5x. "
+            "The market dropped 12% in one hour. "
+            "Reduce leverage to 0.8x during high volatility periods."
+        ))
+        fake_llm = MagicMock()
+        fake_llm.invoke = MagicMock(return_value=fake_msg)
+        loop._get_reflection_llm = lambda: fake_llm
+
+        loop._reflect_on_halt(cycle_id=1, ticker="BTC-USD",
+                              halt_reason="daily_loss_limit+max_drawdown",
+                              equity_before=4450.0)
+
+        events = store.list_halt_events()
+        lesson = events[0]["lessons"]
+        # Lesson should NOT be a mangled fragment like "8x."
+        assert len(lesson) >= 20
+        assert "0.8x" in lesson or "leverage" in lesson.lower()
+
+    def test_halt_reflection_no_recent_trades(self):
+        """I6: when no filled trades exist, prompt should say '(no recent filled trades)'."""
+        store = _make_store()
+        loop = self._make_halt_loop(store)
+
+        captured_prompt = []
+        fake_llm = MagicMock()
+        def _capture_invoke(msgs):
+            captured_prompt.append(msgs[1].content)  # HumanMessage
+            return SimpleNamespace(content="Analysis text here is long enough.")
+        fake_llm.invoke = _capture_invoke
+        loop._get_reflection_llm = lambda: fake_llm
+
+        loop._reflect_on_halt(cycle_id=1, ticker="BTC-USD",
+                              halt_reason="daily_loss_limit", equity_before=4450.0)
+
+        assert len(captured_prompt) == 1
+        assert "(no recent filled trades)" in captured_prompt[0]
+
+    def test_halt_reflection_composite_reason_humanized(self):
+        """S2: composite reason 'daily_loss_limit+max_drawdown' should be
+        humanized to 'daily loss limit + max drawdown' in the prompt."""
+        store = _make_store()
+        loop = self._make_halt_loop(store)
+
+        captured_prompt = []
+        fake_llm = MagicMock()
+        def _capture_invoke(msgs):
+            captured_prompt.append(msgs[1].content)
+            return SimpleNamespace(content="Analysis text here is long enough.")
+        fake_llm.invoke = _capture_invoke
+        loop._get_reflection_llm = lambda: fake_llm
+
+        loop._reflect_on_halt(cycle_id=1, ticker="BTC-USD",
+                              halt_reason="daily_loss_limit+max_drawdown",
+                              equity_before=4450.0)
+
+        assert "daily loss limit + max drawdown" in captured_prompt[0]
+
+    def test_halt_reflection_failure_does_not_arm_cooldown(self):
+        """E3 regression: if LLM invoke fails, the cooldown timestamp must
+        NOT be updated — otherwise a transient failure during a sustained
+        drawdown would silence all subsequent halt reflections for the
+        entire cooldown window."""
+        store = _make_store()
+        loop = self._make_halt_loop(store)
+        loop.config["runner_halt_reflection_cooldown_seconds"] = 3600
+
+        # First halt: LLM raises → lessons=None → cooldown NOT armed
+        fake_llm = MagicMock()
+        fake_llm.invoke = MagicMock(side_effect=RuntimeError("network error"))
+        loop._get_reflection_llm = lambda: fake_llm
+
+        loop._reflect_on_halt(cycle_id=1, ticker="BTC-USD",
+                              halt_reason="daily_loss_limit", equity_before=4450.0)
+        assert fake_llm.invoke.call_count == 1
+        assert loop._last_halt_reflection_ts == 0.0  # NOT armed
+
+        # Second halt immediately after: LLM should be called again (no cooldown)
+        fake_llm.invoke = MagicMock(return_value=SimpleNamespace(
+            content="The halt was caused by a sharp drop. "
+                    "Reduce position size during high volatility periods."
+        ))
+        loop._get_reflection_llm = lambda: fake_llm
+
+        loop._reflect_on_halt(cycle_id=2, ticker="BTC-USD",
+                              halt_reason="daily_loss_limit", equity_before=4400.0)
+        assert fake_llm.invoke.call_count == 1  # called once for the second halt
+
+
+class TestRunOnceHaltReflectionIntegration:
+    """Integration: run_once halt path triggers _reflect_on_halt and records
+    in halt_events table."""
+
+    def test_halt_writes_halt_event_to_db(self):
+        store = _make_store()
+        _seed_baseline(store, equity_before=5000.0)
+        broker = FakeBroker(price_quote=60000.0)
+        loop = _run_once_loop(store, broker, equity_quote=4450.0)
+
+        # Stub LLM to None — halt event should still be recorded
+        loop._get_reflection_llm = lambda: None
+        loop.get_graph = _graph_must_not_run
+
+        summary = loop.run_once("BTC-USD")
+
+        assert summary["halted"] is True
+        events = store.list_halt_events()
+        assert len(events) == 1
+        assert events[0]["cycle_id"] == summary["cycle_id"]
+        assert events[0]["reason"] == "daily_loss_limit"
+        assert events[0]["equity_before"] == 4450.0
+
+    def test_halt_reflection_failure_does_not_block_halt(self):
+        """If _reflect_on_halt raises, the halt must still complete_cycle."""
+        store = _make_store()
+        _seed_baseline(store, equity_before=5000.0)
+        broker = FakeBroker(price_quote=60000.0)
+        loop = _run_once_loop(store, broker, equity_quote=4450.0)
+
+        # Make _reflect_on_halt raise — halt must still complete
+        loop._reflect_on_halt = MagicMock(side_effect=RuntimeError("reflection crashed"))
+        loop.get_graph = _graph_must_not_run
+
+        summary = loop.run_once("BTC-USD")
+
+        assert summary["halted"] is True
+        assert summary["order_status"] == "halted"
+        # Cycle still completed with halted status
+        row = store._conn.execute(
+            "SELECT status FROM cycles WHERE id = ?",
+            (summary["cycle_id"],)).fetchone()
+        assert row[0] == "halted"
+
+    def test_halt_with_llm_writes_lesson_to_memory_log(self):
+        """End-to-end: halt + fake LLM → lesson written to memory log file."""
+        store = _make_store()
+        _seed_baseline(store, equity_before=5000.0)
+        broker = FakeBroker(price_quote=60000.0)
+        mem_path = Path(tempfile.mkdtemp()) / "trading_memory.md"
+        loop = TradingLoop({
+            "runner_daily_loss_limit": -0.10,
+            "runner_max_drawdown": -0.15,
+            "crypto_stop_loss_pct": 10.0,
+            "execution_enabled": True,
+            "memory_log_path": str(mem_path),
+        })
+        loop.store = store
+        loop.snapshot_account = lambda: {"equity_quote": 4450.0}
+        loop.get_broker = lambda: broker
+        loop.get_graph = _graph_must_not_run
+
+        fake_msg = SimpleNamespace(content=(
+            "The halt was caused by a sharp 11% daily drop. "
+            "Recent trades did not contribute significantly. "
+            "This is normal BTC volatility, not a strategy failure. "
+            "Reduce position size when daily ATR exceeds 5% of equity."
+        ))
+        fake_llm = MagicMock()
+        fake_llm.invoke = MagicMock(return_value=fake_msg)
+        loop._get_reflection_llm = lambda: fake_llm
+
+        summary = loop.run_once("BTC-USD")
+
+        assert summary["halted"] is True
+        # Memory log should contain the HALT-LESSON entry
+        assert mem_path.exists()
+        content = mem_path.read_text(encoding="utf-8")
+        assert "HALT-LESSON" in content
+        assert "Reduce position size" in content
+        assert "<!-- ENTRY_END -->" in content
+
+    def test_halt_lesson_memory_log_round_trips_through_parser(self):
+        """E6: verify the HALT-LESSON entry written by halt-reflection can be
+        parsed back by TradingMemoryLog.load_entries() / get_past_context(),
+        so future PM runs actually see the lesson."""
+        store = _make_store()
+        _seed_baseline(store, equity_before=5000.0)
+        broker = FakeBroker(price_quote=60000.0)
+        mem_path = Path(tempfile.mkdtemp()) / "trading_memory.md"
+        loop = TradingLoop({
+            "runner_daily_loss_limit": -0.10,
+            "runner_max_drawdown": -0.15,
+            "crypto_stop_loss_pct": 10.0,
+            "execution_enabled": True,
+            "memory_log_path": str(mem_path),
+        })
+        loop.store = store
+        loop.snapshot_account = lambda: {"equity_quote": 4450.0}
+        loop.get_broker = lambda: broker
+        loop.get_graph = _graph_must_not_run
+
+        fake_msg = SimpleNamespace(content=(
+            "The halt was caused by a sharp 11% daily drop. "
+            "Recent trades did not contribute significantly. "
+            "This is normal BTC volatility, not a strategy failure. "
+            "Reduce position size when daily ATR exceeds 5% of equity."
+        ))
+        fake_llm = MagicMock()
+        fake_llm.invoke = MagicMock(return_value=fake_msg)
+        loop._get_reflection_llm = lambda: fake_llm
+
+        loop.run_once("BTC-USD")
+
+        # Now parse it back through the actual memory log parser
+        from tradingagents.agents.utils.memory import TradingMemoryLog
+        mem_log = TradingMemoryLog({"memory_log_path": str(mem_path)})
+        entries = mem_log.load_entries()
+        assert len(entries) >= 1
+        halt_entry = [e for e in entries if e.get("rating") == "HALT-LESSON"]
+        assert len(halt_entry) == 1, f"expected 1 HALT-LESSON entry, got {halt_entry}"
+        e = halt_entry[0]
+        assert e["ticker"] == "BTC-USD"
+        assert e["pending"] is False
+        assert "Reduce position size" in e["reflection"]
+        assert "Halt reflection" in e["decision"]
+
+        # S3: verify get_past_context() includes the HALT-LESSON entry so
+        # future PM runs actually see the lesson in their context window.
+        context = mem_log.get_past_context("BTC-USD")
+        assert "HALT-LESSON" in context
+        assert "Reduce position size" in context

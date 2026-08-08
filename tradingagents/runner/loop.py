@@ -31,6 +31,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import re
 import time
 import traceback
 from typing import Any
@@ -84,6 +85,13 @@ class TradingLoop:
 
         self._broker: CryptoBroker | None = None
         self._graph = None  # lazily built; imports are heavy (LangGraph)
+        # Cached lightweight reflection LLM (built from config without
+        # assembling the full analysis graph). See _get_reflection_llm.
+        self._reflection_llm: Any = None
+        self._reflection_llm_built = False
+        # Timestamp of the last halt-triggered reflection; used to skip
+        # redundant LLM calls during sustained drawdowns (I3 cooldown).
+        self._last_halt_reflection_ts: float = 0.0
 
     # ------------------------------------------------------------------ #
     # Lazy accessors
@@ -711,9 +719,14 @@ class TradingLoop:
                         HumanMessage(content=prompt_body),
                     ])
                     reflection_text = msg.content if hasattr(msg, "content") else str(msg)
-                    # Extract the last sentence as the "lesson" for quick injection.
-                    sentences = [s.strip() for s in reflection_text.split(".") if s.strip()]
-                    lessons = sentences[-1] + "." if sentences else reflection_text
+                    # E5: robust sentence splitting (same fix as _reflect_on_halt).
+                    # split(".") mangles decimals like "1.5x" → "1" + "5x".
+                    sentences = [
+                        s.strip()
+                        for s in re.split(r"(?<=[.!?])\s+", reflection_text)
+                        if s.strip()
+                    ]
+                    lessons = sentences[-1] if sentences else reflection_text[:200]
                 except Exception as exc:
                     logger.error("reflect: LLM call failed: %s", exc)
                     reflection_text = f"(LLM reflection failed: {exc})"
@@ -769,15 +782,37 @@ class TradingLoop:
         Called from the halt branch in ``run_once`` so every guardrail stop
         generates a halt analysis + lesson in the DB and memory log, turning
         the halt from a "skip this cycle" into a "forced learning opportunity".
-        """
-        broker = self.get_broker()
 
-        # Gather recent orders for context
+        Cooldown: if the last halt reflection was within
+        ``runner_halt_reflection_cooldown_seconds`` (default 3600s), the LLM
+        call is skipped and the previous halt_events row is reused — this
+        avoids burning LLM budget on sustained drawdowns where every cycle
+        halts with an identical reason.
+        """
+        # I3 cooldown: skip redundant LLM calls during sustained drawdowns.
+        cooldown = float(self.config.get("runner_halt_reflection_cooldown_seconds", 3600))
+        now = time.time()
+        if self._last_halt_reflection_ts and (now - self._last_halt_reflection_ts) < cooldown:
+            logger.info(
+                "halt reflection skipped (cooldown %.0fs, last %.0fs ago)",
+                cooldown, now - self._last_halt_reflection_ts,
+            )
+            self.store.record_halt_event(
+                cycle_id=cycle_id, ticker=ticker, reason=halt_reason,
+                equity_before=equity_before,
+                analysis_text="(skipped: within halt reflection cooldown)",
+                lessons=None,
+            )
+            return
+
+        # I2: removed dead `broker = self.get_broker()` — recent_orders comes
+        # from the SQLite store, not the broker.
+
+        # Gather recent orders for context (I6: handle empty case explicitly)
         recent_orders = self.store.list_orders(limit=10)
         recent_trades = [
             o for o in recent_orders if o.get("status") == "filled"
         ]
-        trades_summary = ""
         if recent_trades:
             lines = []
             for t in recent_trades[:5]:
@@ -787,9 +822,14 @@ class TradingLoop:
                 s = t.get("status", "?")
                 lines.append(f"  {act} {sym} @ {p} ({s})")
             trades_summary = "Recent trades:\n" + "\n".join(lines)
+        else:
+            trades_summary = "(no recent filled trades)"
+
+        # S2: humanize the composite halt_reason for the LLM prompt
+        reason_human = halt_reason.replace("+", " + ").replace("_", " ")
 
         prompt_body = (
-            f"Halt triggered: {halt_reason}\n"
+            f"Halt triggered: {reason_human}\n"
             f"Equity before halt: {equity_before}\n"
             f"Ticker: {ticker}\n\n"
             f"{trades_summary}"
@@ -801,14 +841,66 @@ class TradingLoop:
         if llm is not None:
             try:
                 from langchain_core.messages import HumanMessage, SystemMessage
+                from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
-                msg = llm.invoke([
-                    SystemMessage(content=self._HALT_REFLECTION_PROMPT),
-                    HumanMessage(content=prompt_body),
-                ])
-                analysis_text = msg.content if hasattr(msg, "content") else str(msg)
-                sentences = [s.strip() for s in analysis_text.split(".") if s.strip()]
-                lessons = sentences[-1] + "." if sentences else analysis_text
+                # E1: wrap invoke in a thread with an explicit timeout so a
+                # hung LLM call (network stall, not an exception) doesn't
+                # block halt completion indefinitely.
+                #
+                # B1 (round 3): we do NOT use a `with` statement because
+                # ThreadPoolExecutor.__exit__ calls shutdown(wait=True) which
+                # join()s the worker thread — if the LLM call is hung, this
+                # re-blocks until the SDK's own timeout (~600s), defeating the
+                # purpose. Instead we use shutdown(wait=False) so the executor
+                # returns immediately; the orphaned thread will terminate when
+                # the SDK call eventually completes or times out.
+                #
+                # I1 (round 3): on Python 3.10, concurrent.futures.TimeoutError
+                # is NOT a subclass of builtin TimeoutError, so we catch the
+                # futures-specific one explicitly.
+                reflection_timeout = float(self.config.get(
+                    "runner_reflection_llm_timeout", 60.0
+                ))
+                msg_content = None
+
+                def _invoke():
+                    msg = llm.invoke([
+                        SystemMessage(content=self._HALT_REFLECTION_PROMPT),
+                        HumanMessage(content=prompt_body),
+                    ])
+                    return msg.content if hasattr(msg, "content") else str(msg)
+
+                executor = ThreadPoolExecutor(max_workers=1)
+                future = executor.submit(_invoke)
+                try:
+                    msg_content = future.result(timeout=reflection_timeout)
+                except FuturesTimeoutError:
+                    future.cancel()
+                    # shutdown(wait=False) so we don't block on the hung thread
+                    executor.shutdown(wait=False)
+                    raise TimeoutError(
+                        f"halt reflection LLM invoke exceeded {reflection_timeout}s timeout"
+                    )
+                else:
+                    executor.shutdown(wait=False)
+
+                analysis_text = msg_content
+                # I1: robust sentence splitting — split on sentence-ending
+                # punctuation followed by whitespace, NOT on every period
+                # (which would mangle decimals like "1.5x" and prices).
+                sentences = [
+                    s.strip()
+                    for s in re.split(r"(?<=[.!?])\s+", analysis_text)
+                    if s.strip()
+                ]
+                # Pick the last sentence as the lesson; require a minimum
+                # length so we don't inject a fragment like "8x." into the
+                # memory log where it would pollute future PM decisions.
+                if sentences:
+                    candidate = sentences[-1]
+                    lessons = candidate if len(candidate) >= 20 else (
+                        sentences[0] if sentences[0] != candidate else analysis_text[:200]
+                    )
             except Exception as exc:
                 logger.error("halt reflection LLM call failed: %s", exc)
                 analysis_text = f"(LLM halt reflection failed: {exc})"
@@ -823,13 +915,21 @@ class TradingLoop:
             lessons=lessons,
         )
 
-        # Append to trading memory log
+        # E3: only update the cooldown timestamp on SUCCESS (lessons is not
+        # None). If we update it unconditionally, a transient LLM failure
+        # during a sustained drawdown would arm the cooldown and silence all
+        # subsequent halt reflections for the entire cooldown window —
+        # exactly when reflections are most needed.
         if lessons:
-            self._append_trade_lesson_to_memory(
+            self._last_halt_reflection_ts = now
+
+        # Append to trading memory log (I4: use HALT-LESSON label to avoid
+        # polluting the rating field which expects BUY/SELL/HOLD)
+        if lessons:
+            self._append_halt_lesson_to_memory(
                 ticker=ticker,
-                action="HALT",
-                sym=to_ccxt_symbol(ticker) if ticker else "",
-                pnl_pct=None,
+                halt_reason=halt_reason,
+                equity_before=equity_before,
                 lessons=lessons,
             )
 
@@ -837,19 +937,118 @@ class TradingLoop:
             "halt reflection recorded for cycle %d: %s", cycle_id, halt_reason
         )
 
-    def _get_reflection_llm(self):
-        """Return the LLM to use for trade reflection.
+    def _append_halt_lesson_to_memory(
+        self, ticker: str, halt_reason: str, equity_before: float | None, lessons: str
+    ) -> None:
+        """Append a halt-reflection entry to the TradingMemoryLog.
 
-        Reuses the graph's quick-thinking LLM (same provider/key as analysis)
-        so we don't need a separate config. Falls back to None if the graph
-        can't be built (e.g. missing API key), in which case reflection
-        records PnL but skips the LLM prose.
+        Uses a HALT-LESSON label (not BUY/SELL/HOLD) so the memory parser's
+        ``rating`` field isn't polluted with a non-rating value. The entry
+        format is compatible with ``get_past_context()`` — future PM runs
+        will see these lessons in the past-context window.
         """
         try:
-            graph = self.get_graph()
-            return graph.quick_thinking_llm
+            from pathlib import Path
+            log_path = Path(self.config.get("memory_log_path", "")).expanduser()
+            if not log_path:
+                return
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+
+            eq_str = f"{equity_before:.2f}" if equity_before is not None else "n/a"
+            tag = f"[{dt.date.today().isoformat()} | {ticker} | HALT-LESSON | n/a | 0% | 0d]"
+            entry = (
+                f"{tag}\n\n"
+                f"DECISION:\n(Halt reflection: {halt_reason}, equity {eq_str})\n\n"
+                f"REFLECTION:\n{lessons}\n\n"
+                f"<!-- ENTRY_END -->\n\n"
+            )
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(entry)
+            logger.info("halt lesson appended to memory log: %s %s", ticker, halt_reason)
         except Exception as exc:
-            logger.warning("can't build LLM for reflection: %s", exc)
+            logger.warning("failed to append halt lesson to memory log: %s", exc)
+
+    def _get_reflection_llm(self):
+        """Return a lightweight LLM for reflection (halt + hold reflections).
+
+        Builds the LLM directly from config via ``create_llm_client`` — this
+        does NOT assemble the full TradingAgentsGraph (which would construct
+        market/social/news analyst subgraphs). Falls back to None if the
+        client can't be built (e.g. missing API key), in which case reflection
+        records the event but skips the LLM prose.
+
+        B2: previously this called ``self.get_graph().quick_thinking_llm``,
+        which assembled the entire analysis graph just to read one LLM
+        attribute. That violated halt semantics (halt should be lightweight)
+        and risked blocking halt completion on slow graph construction.
+
+        E2: ``_reflection_llm_built`` is only set to True on SUCCESS, so a
+        transient build failure (e.g. network hiccup) allows retry on the
+        next call rather than permanently caching None for the process
+        lifetime.
+
+        E4: ``max_retries`` is coerced with the same validation logic as
+        ``_coerce_max_retries`` in trading_graph (bool/negative rejection +
+        int conversion), inlined here to avoid importing the heavy
+        trading_graph module (which pulls in langgraph, yfinance, etc.).
+
+        Note: ``callbacks`` (LangSmith/monitoring) are NOT forwarded here
+        because the loop does not have access to the graph's callbacks list
+        (it's a constructor param of TradingAgentsGraph, not in config).
+        Reflection LLM calls will not appear in callback-based observability.
+        """
+        if self._reflection_llm_built:
+            return self._reflection_llm
+        try:
+            from tradingagents.llm_clients import create_llm_client
+
+            kwargs: dict[str, Any] = {}
+            provider = str(self.config.get("llm_provider", "")).lower()
+            if provider == "google":
+                thinking = self.config.get("google_thinking_level")
+                if thinking:
+                    kwargs["thinking_level"] = thinking
+            elif provider == "openai":
+                effort = self.config.get("openai_reasoning_effort")
+                if effort:
+                    kwargs["reasoning_effort"] = effort
+            elif provider == "anthropic":
+                effort = self.config.get("anthropic_effort")
+                if effort:
+                    kwargs["effort"] = effort
+            temperature = self.config.get("temperature")
+            if temperature is not None and temperature != "":
+                kwargs["temperature"] = float(temperature)
+            max_retries = self.config.get("llm_max_retries")
+            if max_retries is not None and max_retries != "":
+                # E4/I2: inline _coerce_max_retries logic — same validation as
+                # trading_graph.py but without importing the heavy module.
+                if isinstance(max_retries, bool):
+                    raise ValueError(
+                        f"llm_max_retries must be an integer, not a boolean: {max_retries!r}"
+                    )
+                try:
+                    n = int(max_retries)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"llm_max_retries must be an integer, got {max_retries!r}"
+                    ) from exc
+                if n < 0:
+                    raise ValueError(f"llm_max_retries must be >= 0, got {n}")
+                kwargs["max_retries"] = n
+
+            client = create_llm_client(
+                provider=provider,
+                model=self.config["quick_think_llm"],
+                base_url=self.config.get("backend_url"),
+                **kwargs,
+            )
+            self._reflection_llm = client.get_llm()
+            # E2: only cache as built on success — allows retry on transient failure
+            self._reflection_llm_built = True
+            return self._reflection_llm
+        except Exception as exc:
+            logger.warning("can't build lightweight LLM for reflection: %s", exc)
             return None
 
     # ------------------------------------------------------------------ #
@@ -858,7 +1057,7 @@ class TradingLoop:
 
     _HALT_REFLECTION_PROMPT = (
         "You are a trading agent reviewing a forced halt event. The runner "
-        "automatically stopped all trading equity dropped below a risk threshold.\n"
+        "automatically stopped all trading when equity dropped below a risk threshold.\n"
         "Write 3-5 sentences of plain prose (no bullets, no headers, no markdown).\n\n"
         "Cover in order:\n"
         "1. What caused the halt? (daily loss limit, max drawdown, or both)\n"
@@ -945,9 +1144,14 @@ class TradingLoop:
                         HumanMessage(content=prompt_body),
                     ])
                     reflection_text = msg.content if hasattr(msg, "content") else str(msg)
-                    # Extract the last sentence as the "lesson" for quick injection.
-                    sentences = [s.strip() for s in reflection_text.split(".") if s.strip()]
-                    lessons = sentences[-1] + "." if sentences else reflection_text
+                    # E5: robust sentence splitting (same fix as _reflect_on_halt).
+                    # split(".") mangles decimals like "1.5x" → "1" + "5x".
+                    sentences = [
+                        s.strip()
+                        for s in re.split(r"(?<=[.!?])\s+", reflection_text)
+                        if s.strip()
+                    ]
+                    lessons = sentences[-1] if sentences else reflection_text[:200]
                 except Exception as exc:
                     logger.error("reflect: LLM call failed: %s", exc)
                     reflection_text = f"(LLM reflection failed: {exc})"
