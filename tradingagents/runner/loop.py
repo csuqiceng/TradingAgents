@@ -236,6 +236,44 @@ class TradingLoop:
             logger.warning("stop-loss order recorded for cycle %d: %s",
                            cycle_id, stop_result.get("status"))
 
+        # 1c. Account-level guardrails: halt this cycle (skip LLM + new orders)
+        # when equity drops below daily_loss_limit or max_drawdown thresholds.
+        # stop-loss above already ran (position-level safety net is independent
+        # of account-level halt). Halt still records a cycle row for audit and
+        # skips post-cycle snapshot (equity_after=None) so it doesn't pollute
+        # the peak statistic.
+        halted = False
+        halt_reason = ""
+        try:
+            halted, halt_reason = self._check_guardrails(equity_before)
+        except Exception as exc:
+            logger.error("guardrail check failed: %s", exc)
+        if halted:
+            logger.warning("cycle %d halted: %s", cycle_id, halt_reason)
+            self.store.complete_cycle(
+                cycle_id,
+                status="halted",
+                rating=None,
+                order_status="halted",
+                equity_after=None,
+                error=None,
+                decision_md=None,
+                report_path=None,
+            )
+            return {
+                "cycle_id": cycle_id,
+                "ticker": ticker,
+                "trade_date": trade_date,
+                "rating": None,
+                "order_status": "halted",
+                "equity_before": equity_before,
+                "equity_after": None,
+                "report_path": None,
+                "error": None,
+                "halted": True,
+                "halt_reason": halt_reason,
+            }
+
         rating: str | None = None
         order_status: str | None = None
         order_result: dict[str, Any] | None = None
@@ -364,6 +402,13 @@ class TradingLoop:
                 for ticker in self.tickers:
                     summary = self.run_once(ticker)
                     self._log_summary(summary)
+                    # Halted cycles don't count toward cycle_count: they ran no
+                    # LLM and no orders, so reflecting on them is meaningless
+                    # (reflection would burn LLM tokens for a cycle that was
+                    # deliberately skipped). The cycle still logged + completed
+                    # for audit; we just don't advance the reflection cadence.
+                    if summary.get("halted"):
+                        continue
                     cycle_count += 1
                     if self.max_cycles and cycle_count >= self.max_cycles:
                         logger.info("max_cycles=%d reached, stopping", self.max_cycles)
@@ -485,6 +530,76 @@ class TradingLoop:
         except Exception:
             pass
         return dict(result)
+
+    # ------------------------------------------------------------------ #
+    # Account-level guardrails — halt a cycle on equity drawdown
+    # ------------------------------------------------------------------ #
+
+    def _check_guardrails(self, equity_before: float | None) -> tuple[bool, str]:
+        """Account-level guardrails: halt a cycle when equity drops too far.
+
+        Two independent checks (either can halt):
+        1. Daily floating loss: equity_before vs today's UTC baseline (first
+           non-NULL equity_before of the UTC day).
+        2. Historical drawdown: equity_before vs all-time peak equity_after.
+
+        Returns (True, reason) if halted, (False, "") if OK. reason may be a
+        composite like "daily_loss_limit+max_drawdown" when both trigger.
+
+        Fail-open policy:
+        - equity_before=None (snapshot failed) → skip both checks (let stop-loss
+          / cooldown backstop).
+        - state query raises → fail-open with WARNING (don't crash run_once).
+        - Threshold validation (< 0) runs OUTSIDE the try/except so a
+          misconfigured positive threshold is never silently swallowed.
+        """
+        if equity_before is None:
+            return (False, "")
+
+        daily_limit = float(self.config.get("runner_daily_loss_limit", -0.10))
+        drawdown_limit = float(self.config.get("runner_max_drawdown", -0.15))
+
+        # Validate thresholds are negative — a positive threshold would make
+        # `pct <= threshold` true for almost every cycle (permanent halt). This
+        # check is OUTSIDE the fail-open try/except so it is never swallowed.
+        if daily_limit >= 0:
+            raise ValueError(
+                f"runner_daily_loss_limit must be negative, got {daily_limit}"
+            )
+        if drawdown_limit >= 0:
+            raise ValueError(
+                f"runner_max_drawdown must be negative, got {drawdown_limit}"
+            )
+
+        reasons: list[str] = []
+
+        # Wrap ONLY the state queries in fail-open try/except. Threshold
+        # validation above is deliberately outside.
+        try:
+            baseline = self.store.get_day_baseline_equity()
+        except Exception as exc:
+            logger.warning("guardrail day_baseline query failed: %s", exc)
+            baseline = None
+
+        if baseline is not None and baseline > 0:
+            daily_pct = (equity_before - baseline) / baseline
+            if daily_pct <= daily_limit:
+                reasons.append("daily_loss_limit")
+
+        try:
+            peak = self.store.get_peak_equity()
+        except Exception as exc:
+            logger.warning("guardrail peak_equity query failed: %s", exc)
+            peak = None
+
+        if peak is not None and peak > 0:
+            drawdown_pct = (equity_before - peak) / peak
+            if drawdown_pct <= drawdown_limit:
+                reasons.append("max_drawdown")
+
+        if reasons:
+            return (True, "+".join(reasons))
+        return (False, "")
 
     # ------------------------------------------------------------------ #
     # Trade reflection — the "learn from actual trades" layer

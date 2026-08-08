@@ -52,6 +52,8 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_RUNNER_REFLECT_EVERY_N_CYCLES": "runner_reflect_every_n_cycles",
     "TRADINGAGENTS_RUNNER_REFLECT_MIN_AGE_HOURS":  "runner_reflect_min_age_hours",
     "TRADINGAGENTS_RUNNER_REFLECT_HOLD_EVERY_N_CYCLES": "runner_reflect_hold_every_n_cycles",
+    "TRADINGAGENTS_RUNNER_DAILY_LOSS_LIMIT":   "runner_daily_loss_limit",
+    "TRADINGAGENTS_RUNNER_MAX_DRAWDOWN":       "runner_max_drawdown",
 }
 
 
@@ -285,4 +287,12 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # ticker (3 tickers × 6 outer rounds/day at 4h cadence = 18 cycle-runs/day),
     # so 18 ≈ once per day.
     "runner_reflect_hold_every_n_cycles": 18,
+    # Guardrails halt: skip a cycle (no LLM, no new orders, but stop-loss still
+    # runs) when the account equity drops below these thresholds. Both are
+    # NEGATIVE numbers (loss percentages). daily_loss_limit compares against
+    # the first non-NULL equity_before of the UTC day; max_drawdown compares
+    # against the all-time peak equity_after. Set to 0 or a positive number to
+    # disable (but _check_guardrails validates < 0 at runtime and raises).
+    "runner_daily_loss_limit": -0.10,   # -10% intraday floating loss
+    "runner_max_drawdown":     -0.15,   # -15% historical drawdown from peak
 })

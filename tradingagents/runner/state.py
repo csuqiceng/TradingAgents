@@ -496,3 +496,51 @@ class RunnerStateStore:
         )
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+    def get_day_baseline_equity(self) -> float | None:
+        """Return today's first non-NULL ``equity_before`` (UTC natural-day window).
+
+        Anchors the daily P&L guardrail: "how much did I start the day with?"
+        so intra-day drawdown is measured against the day's opening equity,
+        not the all-time peak. The window is [00:00, 24:00) UTC so the
+        baseline resets cleanly at UTC midnight regardless of the machine's
+        local timezone.
+
+        Returns None when no cycle has a non-NULL ``equity_before`` yet today.
+        """
+        import datetime as _dt
+        now_utc = _dt.datetime.now(_dt.timezone.utc)
+        start_of_day = _dt.datetime(now_utc.year, now_utc.month, now_utc.day, tzinfo=_dt.timezone.utc)
+        end_of_day = start_of_day + _dt.timedelta(days=1)
+        ts_start = start_of_day.timestamp()
+        ts_end = end_of_day.timestamp()
+        cur = self._conn.execute(
+            """
+            SELECT equity_before FROM cycles
+            WHERE ts >= ? AND ts < ? AND equity_before IS NOT NULL
+            ORDER BY id ASC LIMIT 1
+            """,
+            (ts_start, ts_end),
+        )
+        row = cur.fetchone()
+        return float(row[0]) if row else None
+
+    def get_peak_equity(self) -> float | None:
+        """Return the max ``equity_after`` across all completed/error cycles.
+
+        Anchors the all-time drawdown guardrail (highest equity watermark
+        seen since the runner started trading). Only cycles that actually
+        finished (``completed`` or ``error``) count — ``running`` cycles are
+        provisional and ``halted`` cycles are excluded so an abandoned
+        mid-cycle snapshot can't anchor the watermark.
+
+        Returns None when no qualifying cycle has a non-NULL ``equity_after``.
+        """
+        cur = self._conn.execute(
+            """
+            SELECT MAX(equity_after) FROM cycles
+            WHERE status IN ('completed','error') AND equity_after IS NOT NULL
+            """,
+        )
+        row = cur.fetchone()
+        return float(row[0]) if row and row[0] is not None else None
