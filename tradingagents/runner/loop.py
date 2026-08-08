@@ -9,9 +9,10 @@ Wraps the single-shot ``TradingAgentsGraph.propagate`` in a loop that:
   4. Sleeps ``runner_interval_seconds`` and repeats, across one or more
      tickers, until interrupted or ``runner_max_cycles`` is reached.
 
-The loop is synchronous (one cycle at a time). Crypto execution is spot-only
-and the analysis graph is a blocking LangGraph invoke, so there is no benefit
-to asyncio here — simplicity and debuggability win.
+The loop uses parallel execution: all configured tickers are analysed
+concurrently via a ThreadPoolExecutor. Crypto execution is spot-only
+and the analysis graph is a blocking LangGraph invoke, so asyncio offers
+no benefit — simplicity and debuggability win.
 
 Design notes:
 - The exchange is ALWAYS authoritative for "what do I hold". The SQLite
@@ -33,9 +34,11 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import traceback
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -108,7 +111,9 @@ class TradingLoop:
                 os.environ.setdefault(k, proxy)
 
         self._broker: CryptoBroker | None = None
+        self._broker_lock = threading.Lock()
         self._graph: dict[str, Any] = {}  # lazily built; keyed by asset_type
+        self._graph_lock = threading.Lock()
         # Cached lightweight reflection LLM (built from config without
         # assembling the full analysis graph). See _get_reflection_llm.
         self._reflection_llm: Any = None
@@ -123,21 +128,28 @@ class TradingLoop:
 
     def get_broker(self) -> CryptoBroker:
         """A shared CryptoBroker for account queries (separate from the one
-        the graph builds per-cycle for order placement, but same creds)."""
+        the graph builds per-cycle for order placement, but same creds).
+
+        Thread-safe: lazy init is guarded by a lock; after construction,
+        all threads share the same read-only broker instance."""
         if self._broker is None:
-            self._broker = CryptoBroker(
-                exchange_id=self.config.get("crypto_exchange", "binance"),
-                api_key=self.config.get("crypto_api_key"),
-                secret=self.config.get("crypto_secret"),
-                passphrase=self.config.get("crypto_passphrase"),
-                https_proxy=self.config.get("crypto_https_proxy"),
-                testnet=self.config.get("execution_mode", "paper") == "paper",
-                quote_budget=self.config.get("crypto_quote_budget", 5000.0),
-                max_position_fraction=self.config.get("crypto_max_position", 0.2),
-                cooldown_seconds=self.config.get("crypto_cooldown_seconds"),
-                buy_cooldown_seconds=self.config.get("crypto_buy_cooldown_seconds"),
-                sell_cooldown_seconds=self.config.get("crypto_sell_cooldown_seconds"),
-            )
+            with self._broker_lock:
+                # Double-check after acquiring lock (race prevention)
+                if self._broker is not None:
+                    return self._broker
+                self._broker = CryptoBroker(
+                    exchange_id=self.config.get("crypto_exchange", "binance"),
+                    api_key=self.config.get("crypto_api_key"),
+                    secret=self.config.get("crypto_secret"),
+                    passphrase=self.config.get("crypto_passphrase"),
+                    https_proxy=self.config.get("crypto_https_proxy"),
+                    testnet=self.config.get("execution_mode", "paper") == "paper",
+                    quote_budget=self.config.get("crypto_quote_budget", 5000.0),
+                    max_position_fraction=self.config.get("crypto_max_position", 0.2),
+                    cooldown_seconds=self.config.get("crypto_cooldown_seconds"),
+                    buy_cooldown_seconds=self.config.get("crypto_buy_cooldown_seconds"),
+                    sell_cooldown_seconds=self.config.get("crypto_sell_cooldown_seconds"),
+                )
         return self._broker
 
     def get_graph(self, asset_type: str = "crypto"):
@@ -151,22 +163,29 @@ class TradingLoop:
         - "crypto": market + social + news (full 7-agent pipeline)
         - "stock" (A-share): market + news + fundamentals (no social —
           Reddit/StockTwits are useless for Chinese stocks)
+
+        Thread-safe: lazy init is guarded by a lock so parallel ``run_once``
+        calls from ``run_forever``'s ThreadPoolExecutor don't race.
         """
         if asset_type not in self._graph:
-            # Lazy import: tradingagents.graph pulls in LangGraph + all agents.
-            from tradingagents.graph.trading_graph import TradingAgentsGraph
+            with self._graph_lock:
+                # Double-check after acquiring lock (race prevention)
+                if asset_type in self._graph:
+                    return self._graph[asset_type]
+                # Lazy import: tradingagents.graph pulls in LangGraph + all agents.
+                from tradingagents.graph.trading_graph import TradingAgentsGraph
 
-            if asset_type == "crypto":
-                # Crypto: full pipeline with social media sentiment.
-                analysts = ["market", "social", "news"]
-            else:
-                # A-share stocks: skip social (Reddit/StockTwits don't work
-                # for Chinese stocks); use fundamentals instead.
-                analysts = ["market", "news", "fundamentals"]
+                if asset_type == "crypto":
+                    # Crypto: full pipeline with social media sentiment.
+                    analysts = ["market", "social", "news"]
+                else:
+                    # A-share stocks: skip social (Reddit/StockTwits don't work
+                    # for Chinese stocks); use fundamentals instead.
+                    analysts = ["market", "news", "fundamentals"]
 
-            self._graph[asset_type] = TradingAgentsGraph(
-                analysts, config=self.config, debug=False
-            )
+                self._graph[asset_type] = TradingAgentsGraph(
+                    analysts, config=self.config, debug=False
+                )
         return self._graph[asset_type]
 
     # ------------------------------------------------------------------ #
@@ -353,21 +372,19 @@ class TradingLoop:
         try:
             graph = self.get_graph(asset_type)
 
-            # 启动保护期：前 N 轮只分析不下单
-            if in_warmup:
-                saved_exec = self.config.get("execution_enabled")
-                self.config["execution_enabled"] = False
-
             # 2. Full analysis -> decision markdown.
+            # Pass execution_enabled flag directly (instead of mutating
+            # shared config) so parallel execution from run_forever is
+            # thread-safe. 保护期内传 False 跳过执行，周期结束后自动恢复。
             # propagate() already calls _execute_decision internally when
             # execution_enabled is true (see trading_graph.py). We must NOT
             # call _execute_decision again here — that would double-execute
             # and the second call would always hit the cooldown the first
             # call just wrote, producing a misleading "skipped" record.
-            final_state, decision_md = graph.propagate(ticker, trade_date, asset_type=asset_type)
-
-            if in_warmup:
-                self.config["execution_enabled"] = saved_exec
+            final_state, decision_md = graph.propagate(
+                ticker, trade_date, asset_type=asset_type,
+                execution_enabled=not in_warmup,
+            )
 
             # Save the full analysis report tree (analysts / debate / trader /
             # risk / PM decision) to disk so every cycle has a reviewable
@@ -482,13 +499,18 @@ class TradingLoop:
     def run_forever(self) -> None:
         """Run cycles forever (or until ``max_cycles`` reached / interrupted).
 
-        Each cycle iterates over all configured tickers sequentially, then
-        sleeps ``interval`` seconds. The interval is measured from the start
-        of one cycle to the start of the next, so a slow analysis simply
-        extends the wall-clock cadence rather than stacking up.
+        **Parallel execution**: all configured tickers are analysed
+        concurrently via a ThreadPoolExecutor. This is safe because:
+        - ``get_graph`` lazy init is thread-safe (guarded by a lock).
+        - ``get_broker`` lazy init is thread-safe (guarded by a lock).
+        - ``RunnerStateStore`` uses ``check_same_thread=False``.
+
+        After all tickers finish, the loop sleeps ``interval`` seconds.
+        The interval is measured from the start of one round to the start
+        of the next, so a slow analysis round simply extends the cadence.
         """
         logger.info(
-            "TradingLoop starting: tickers=%s interval=%ss max_cycles=%s",
+            "TradingLoop starting: tickers=%s interval=%ss max_cycles=%s (parallel)",
             self.tickers, self.interval, self.max_cycles or "inf",
         )
         reflect_every = int(self.config.get("runner_reflect_every_n_cycles", 0) or 0)
@@ -496,48 +518,48 @@ class TradingLoop:
         reflect_hold_every = int(self.config.get("runner_reflect_hold_every_n_cycles", 0) or 0)
         cycle_count = 0
         try:
-            while True:
-                for ticker in self.tickers:
-                    summary = self.run_once(ticker)
-                    self._log_summary(summary)
-                    # Halted cycles don't count toward cycle_count: they ran no
-                    # LLM and no orders, so reflecting on them is meaningless
-                    # (reflection would burn LLM tokens for a cycle that was
-                    # deliberately skipped). The cycle still logged + completed
-                    # for audit; we just don't advance the reflection cadence.
-                    if summary.get("halted"):
-                        continue
-                    cycle_count += 1
+            with ThreadPoolExecutor(max_workers=len(self.tickers)) as pool:
+                while True:
+                    # Submit all tickers concurrently.
+                    futures = {pool.submit(self.run_once, t): t for t in self.tickers}
+                    for f in as_completed(futures):
+                        ticker = futures[f]
+                        try:
+                            summary = f.result()
+                        except Exception as exc:
+                            logger.error("parallel cycle failed for %s: %s", ticker, exc)
+                            continue
+                        self._log_summary(summary)
+                        # Halted cycles don't count toward cycle_count.
+                        if summary.get("halted"):
+                            continue
+                        cycle_count += 1
+                        if self.max_cycles and cycle_count >= self.max_cycles:
+                            logger.info("max_cycles=%d reached, stopping", self.max_cycles)
+                            return
+
                     if self.max_cycles and cycle_count >= self.max_cycles:
-                        logger.info("max_cycles=%d reached, stopping", self.max_cycles)
                         return
 
-                # Periodically reflect on filled trades: pull unreflected
-                # orders, compute PnL, call the LLM for lessons, and append
-                # to the memory log so the next cycle learns from them.
-                if reflect_every and cycle_count % reflect_every == 0:
-                    logger.info("auto-reflecting on trades (cycle %d)", cycle_count)
-                    try:
-                        self.reflect_on_trades(min_age_hours=reflect_min_age)
-                    except Exception as exc:
-                        logger.error("auto-reflection failed: %s", exc)
+                    # Periodically reflect on filled trades.
+                    if reflect_every and cycle_count % reflect_every == 0:
+                        logger.info("auto-reflecting on trades (cycle %d)", cycle_count)
+                        try:
+                            self.reflect_on_trades(min_age_hours=reflect_min_age)
+                        except Exception as exc:
+                            logger.error("auto-reflection failed: %s", exc)
 
-                # Periodically reflect on HOLD decisions too: when nothing
-                # fills, the only feedback is the price path after a no-trade
-                # call. Reviewing those keeps the system learning during idle
-                # stretches instead of only after fills.
-                if reflect_hold_every and cycle_count % reflect_hold_every == 0:
-                    logger.info("auto-reflecting on HOLD decisions (cycle %d)", cycle_count)
-                    try:
-                        self.reflect_on_decisions(min_age_hours=reflect_min_age)
-                    except Exception as exc:
-                        logger.error("hold-reflection failed: %s", exc)
+                    # Periodically reflect on HOLD decisions.
+                    if reflect_hold_every and cycle_count % reflect_hold_every == 0:
+                        logger.info("auto-reflecting on HOLD decisions (cycle %d)", cycle_count)
+                        try:
+                            self.reflect_on_decisions(min_age_hours=reflect_min_age)
+                        except Exception as exc:
+                            logger.error("hold-reflection failed: %s", exc)
 
-                if self.max_cycles and cycle_count >= self.max_cycles:
-                    return
-                # Sleep until the next cycle. If analysis took longer than
-                # interval, we start immediately (no negative sleep).
-                time.sleep(max(0, self.interval))
+                    # Sleep until the next round. If analysis took longer
+                    # than interval, start immediately (no negative sleep).
+                    time.sleep(max(0, self.interval))
         except KeyboardInterrupt:
             logger.info("interrupted by user, stopping")
 
