@@ -426,12 +426,11 @@ class TradingAgentsGraph:
         past_context = self.memory_log.get_past_context(company_name)
         instrument_context = self.resolve_instrument_context(company_name, asset_type)
 
-        # When crypto execution is live, anchor the PM to the *executable*
-        # price: yfinance OHLCV data (daily candles, possibly stale) drives the
-        # analysis, but the broker fills at the current OKX spot price. Inject
-        # the live quote so the PM weighs "what I can actually trade at" — the
-        # two can diverge meaningfully in fast markets and the decision should
-        # not be priced on a candle that no longer exists.
+        # When crypto execution is live, inject the PM with account context:
+        # 1. Live executable price (yfinance OHLCV may lag).
+        # 2. Current holdings for this ticker — so the PM knows whether it
+        #    already has a position, and can size SELL/BUY recommendations
+        #    accordingly instead of making blind market calls.
         if self.config.get("execution_enabled") and asset_type == "crypto":
             try:
                 from tradingagents.execution import CryptoBroker
@@ -450,20 +449,36 @@ class TradingAgentsGraph:
                     passphrase=self.config.get("crypto_passphrase"),
                     https_proxy=self.config.get("crypto_https_proxy"),
                 )
-                live_price = broker._fetch_price(to_ccxt_symbol(company_name))
+                ccxt_symbol = to_ccxt_symbol(company_name)
+                live_price = broker._fetch_price(ccxt_symbol)
+                balance = broker._fetch_balance()
+                equity = broker._quote_equity(balance)
+                base = ccxt_symbol.split("/")[0]
+                holding_amt = broker._base_free(balance, base)
+                holding_value = broker._base_value(balance, base, live_price)
+                quote_free = broker._quote_free(balance)
+
                 exchange_name = self.config.get("crypto_exchange", "binance")
-                live_note = (
-                    f"**Live spot price right now on {exchange_name.upper()} "
-                    f"({to_ccxt_symbol(company_name)}): {live_price:,.2f} USDT.** "
-                    "This is the executable price. yfinance OHLCV data above may "
-                    "lag or differ from it; weigh the live price heavily when "
-                    "deciding entry/exit timing."
+                position_ctx = (
+                    f"**当前账户持仓（来自 {exchange_name.upper()} 实时数据）**\n"
+                    f"- 总权益（USDT 余额）: ${equity:,.2f}\n"
+                    f"- 可用 USDT: ${quote_free:,.2f}\n"
+                    f"- {base} 持仓: {holding_amt:.8f}（价值约 ${holding_value:,.2f}）\n"
+                    f"- 当前 {base} 现货价格: {live_price:,.2f} USDT\n"
+                    f"\n"
+                    f"**重要提示：请结合持仓情况做决策。**\n"
+                    f"- 如果持仓 > 0 且看空 → 考虑 SELL/Underweight\n"
+                    f"- 如果持仓为 0 且看多 → 考虑 BUY/Overweight\n"
+                    f"- 如果持仓 > 0 但看多 → 可以 HOLD 继续持有\n"
+                    f"- 如果持仓为 0 且看空 → HOLD（做空不在当前策略范围内）\n"
+                    f"- 单笔最大买入预算: ${self.config.get('crypto_quote_budget', 5000.0):,.0f}\n"
+                    f"- 单币种最大仓位占比: {self.config.get('crypto_max_position', 0.2):.0%}"
                 )
                 past_context = (
-                    f"{past_context}\n\n{live_note}" if past_context else live_note
+                    f"{past_context}\n\n{position_ctx}" if past_context else position_ctx
                 )
             except Exception as exc:
-                logger.warning("could not fetch live price for decision context: %s", exc)
+                logger.warning("could not fetch account context for decision: %s", exc)
 
         init_agent_state = self.propagator.create_initial_state(
             company_name,
