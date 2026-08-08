@@ -29,11 +29,13 @@ Design notes:
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import os
 import re
 import time
 import traceback
+import urllib.request
 from typing import Any
 
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -41,6 +43,28 @@ from tradingagents.execution.crypto_broker import CryptoBroker, to_ccxt_symbol
 from tradingagents.runner.state import RunnerStateStore
 
 logger = logging.getLogger(__name__)
+
+# 飞书机器人 Webhook (通过 .env 的 TRADINGAGENTS_FEISHU_WEBHOOK 配置)
+_FEISHU_WEBHOOK = os.environ.get("TRADINGAGENTS_FEISHU_WEBHOOK", "")
+
+
+def _feishu_send(text: str) -> None:
+    """通过飞书 Webhook 发送通知消息（静默失败，不抛出异常）。"""
+    if not _FEISHU_WEBHOOK:
+        return
+    try:
+        payload = json.dumps({
+            "msg_type": "text",
+            "content": {"text": text},
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            _FEISHU_WEBHOOK,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as exc:
+        logger.warning("feishu notify failed: %s", exc)
 
 # Tickers that mean crypto. Kept local (not imported from cli.utils) to avoid
 # a cli -> tradingagents dependency direction; the runner is a library module.
@@ -84,7 +108,7 @@ class TradingLoop:
                 os.environ.setdefault(k, proxy)
 
         self._broker: CryptoBroker | None = None
-        self._graph = None  # lazily built; imports are heavy (LangGraph)
+        self._graph: dict[str, Any] = {}  # lazily built; keyed by asset_type
         # Cached lightweight reflection LLM (built from config without
         # assembling the full analysis graph). See _get_reflection_llm.
         self._reflection_llm: Any = None
@@ -116,18 +140,34 @@ class TradingLoop:
             )
         return self._broker
 
-    def get_graph(self):
-        """Lazily build the TradingAgentsGraph. Heavy import deferred so
-        ``TradingLoop()`` construction is cheap (tests that stub the graph
-        don't pay the LangGraph import cost)."""
-        if self._graph is None:
+    def get_graph(self, asset_type: str = "crypto"):
+        """Lazily build the TradingAgentsGraph, keyed by asset_type.
+
+        Heavy import deferred so ``TradingLoop()`` construction is cheap.
+        Two separate graphs are cached: one for crypto (full pipeline) and
+        one for stocks (A-share, lighter).
+
+        ``asset_type`` selects the analyst team:
+        - "crypto": market + social + news (full 7-agent pipeline)
+        - "stock" (A-share): market + news + fundamentals (no social —
+          Reddit/StockTwits are useless for Chinese stocks)
+        """
+        if asset_type not in self._graph:
             # Lazy import: tradingagents.graph pulls in LangGraph + all agents.
             from tradingagents.graph.trading_graph import TradingAgentsGraph
 
-            # Crypto has no fundamentals data; default to market+social+news.
-            analysts = ["market", "social", "news"]
-            self._graph = TradingAgentsGraph(analysts, config=self.config, debug=False)
-        return self._graph
+            if asset_type == "crypto":
+                # Crypto: full pipeline with social media sentiment.
+                analysts = ["market", "social", "news"]
+            else:
+                # A-share stocks: skip social (Reddit/StockTwits don't work
+                # for Chinese stocks); use fundamentals instead.
+                analysts = ["market", "news", "fundamentals"]
+
+            self._graph[asset_type] = TradingAgentsGraph(
+                analysts, config=self.config, debug=False
+            )
+        return self._graph[asset_type]
 
     # ------------------------------------------------------------------ #
     # Account reconciliation
@@ -214,6 +254,13 @@ class TradingLoop:
                 price_at_decision = self.get_broker()._fetch_price(to_ccxt_symbol(ticker))
         except Exception as exc:
             logger.warning("price anchor fetch failed for %s: %s", ticker, exc)
+
+        # 启动保护期：前 N 轮只分析不下单，防止一上来就清仓
+        warmup_cycles = int(self.config.get("runner_warmup_cycles", 3))
+        in_warmup = bool(self.config.get("execution_enabled", True)) and self.store.count_cycles(ticker) < warmup_cycles
+        if in_warmup:
+            logger.info("warm-up cycle %d/%d for %s — analysis only, no execution",
+                        self.store.count_cycles(ticker) + 1, warmup_cycles, ticker)
 
         cycle_id = self.store.start_cycle(ticker, trade_date, equity_before, price_at_decision)
         logger.info("=== cycle %d: %s @ %s (%s) ===", cycle_id, ticker, trade_date, asset_type)
@@ -304,7 +351,13 @@ class TradingLoop:
         report_path: str | None = None
 
         try:
-            graph = self.get_graph()
+            graph = self.get_graph(asset_type)
+
+            # 启动保护期：前 N 轮只分析不下单
+            if in_warmup:
+                saved_exec = self.config.get("execution_enabled")
+                self.config["execution_enabled"] = False
+
             # 2. Full analysis -> decision markdown.
             # propagate() already calls _execute_decision internally when
             # execution_enabled is true (see trading_graph.py). We must NOT
@@ -312,6 +365,9 @@ class TradingLoop:
             # and the second call would always hit the cooldown the first
             # call just wrote, producing a misleading "skipped" record.
             final_state, decision_md = graph.propagate(ticker, trade_date, asset_type=asset_type)
+
+            if in_warmup:
+                self.config["execution_enabled"] = saved_exec
 
             # Save the full analysis report tree (analysts / debate / trader /
             # risk / PM decision) to disk so every cycle has a reviewable
@@ -367,6 +423,26 @@ class TradingLoop:
                 exchange_order_id=(order_result.get("order") or {}).get("id"),
                 raw=order_result,
             )
+
+            # 飞书通知：有实际下单动作才通知（filled / error），跳过 skip/none
+            if order_result.get("status") in ("filled", "error"):
+                action = order_result.get("action", "?")
+                symbol = order_result.get("symbol", ticker)
+                price = order_result.get("price")
+                amount = order_result.get("amount")
+                status = order_result.get("status")
+                reason = order_result.get("reason", "")
+                msg = (
+                    f"🤖 TradingAgents\n"
+                    f"{symbol} {action} {status}\n"
+                )
+                if price and amount:
+                    msg += f"价格: ${price} | 数量: {amount}\n"
+                    msg += f"金额: ${float(price) * float(amount):.2f}\n"
+                if reason:
+                    msg += f"原因: {reason}\n"
+                msg += f"评级: {rating or 'N/A'} | cycle #{cycle_id}"
+                _feishu_send(msg)
 
         # Post-cycle account snapshot (equity_after).
         equity_after = None

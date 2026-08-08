@@ -329,6 +329,12 @@ class RunnerStateStore:
         rows = self.list_cycles(limit=1)
         return rows[0] if rows else None
 
+    def count_cycles(self, ticker: str) -> int:
+        cur = self._conn.execute(
+            "SELECT COUNT(*) FROM cycles WHERE ticker = ?", (ticker,)
+        )
+        return cur.fetchone()[0]
+
     # ------------------------------------------------------------------ #
     # Trade reflections
     # ------------------------------------------------------------------ #

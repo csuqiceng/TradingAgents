@@ -449,7 +449,7 @@ class TestRunOnceGuardrailHalt:
             propagate=_propagate,
             save_reports=lambda *a, **k: Path("/tmp/x"),
         )
-        loop.get_graph = lambda: graph
+        loop.get_graph = lambda asset_type: graph
 
         summary = loop.run_once("BTC-USD")
 
@@ -541,7 +541,7 @@ class TestRunOnceGuardrailHalt:
             propagate=_propagate,
             save_reports=lambda *a, **k: Path("/tmp/x"),
         )
-        loop.get_graph = lambda: graph
+        loop.get_graph = lambda asset_type: graph
 
         summary = loop.run_once("BTC-USD")
 

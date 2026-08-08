@@ -51,6 +51,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_RUNNER_DB_PATH":          "runner_db_path",
     "TRADINGAGENTS_RUNNER_REFLECT_EVERY_N_CYCLES": "runner_reflect_every_n_cycles",
     "TRADINGAGENTS_RUNNER_REFLECT_MIN_AGE_HOURS":  "runner_reflect_min_age_hours",
+    "TRADINGAGENTS_RUNNER_WARMUP_CYCLES":          "runner_warmup_cycles",
     "TRADINGAGENTS_RUNNER_REFLECT_HOLD_EVERY_N_CYCLES": "runner_reflect_hold_every_n_cycles",
     "TRADINGAGENTS_RUNNER_DAILY_LOSS_LIMIT":   "runner_daily_loss_limit",
     "TRADINGAGENTS_RUNNER_MAX_DRAWDOWN":       "runner_max_drawdown",
@@ -287,6 +288,7 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # ticker (3 tickers × 6 outer rounds/day at 4h cadence = 18 cycle-runs/day),
     # so 18 ≈ once per day.
     "runner_reflect_hold_every_n_cycles": 18,
+    "runner_warmup_cycles": 3,
     # Guardrails halt: skip a cycle (no LLM, no new orders, but stop-loss still
     # runs) when the account equity drops below these thresholds. Both are
     # NEGATIVE numbers (loss percentages). daily_loss_limit compares against
