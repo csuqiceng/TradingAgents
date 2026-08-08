@@ -99,6 +99,19 @@ CREATE INDEX IF NOT EXISTS idx_orders_ts    ON orders(ts);
 CREATE INDEX IF NOT EXISTS idx_cycles_ts    ON cycles(ts);
 CREATE INDEX IF NOT EXISTS idx_reflections_order ON trade_reflections(order_id);
 CREATE INDEX IF NOT EXISTS idx_reflections_ts    ON trade_reflections(ts);
+
+CREATE TABLE IF NOT EXISTS halt_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              REAL NOT NULL,
+    cycle_id        INTEGER NOT NULL,
+    ticker          TEXT,
+    reason          TEXT NOT NULL,
+    equity_before   REAL,
+    analysis_text   TEXT,
+    lessons         TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_halt_events_ts ON halt_events(ts);
 """
 
 # --- Idempotent schema migrations for pre-existing DBs ---------------------
@@ -352,6 +365,34 @@ class RunnerStateStore:
         )
         self._conn.commit()
         return cur.lastrowid
+
+    def record_halt_event(
+        self,
+        cycle_id: int,
+        ticker: str | None,
+        reason: str,
+        equity_before: float | None,
+        analysis_text: str | None = None,
+        lessons: str | None = None,
+    ) -> int:
+        """Record a guardrail halt event. Returns the inserted rowid."""
+        cur = self._conn.execute(
+            """
+            INSERT INTO halt_events
+                (ts, cycle_id, ticker, reason, equity_before, analysis_text, lessons)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (time.time(), cycle_id, ticker, reason, equity_before, analysis_text, lessons),
+        )
+        self._conn.commit()
+        return cur.lastrowid
+
+    def list_halt_events(self, limit: int = 10) -> list[dict[str, Any]]:
+        cur = self._conn.execute(
+            "SELECT * FROM halt_events ORDER BY ts DESC LIMIT ?", (limit,)
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
 
     def list_reflections(self, limit: int = 20) -> list[dict[str, Any]]:
         cur = self._conn.execute(

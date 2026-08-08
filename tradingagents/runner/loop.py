@@ -250,6 +250,20 @@ class TradingLoop:
             logger.error("guardrail check failed: %s", exc)
         if halted:
             logger.warning("cycle %d halted: %s", cycle_id, halt_reason)
+
+            # Halt-triggered reflection: analyze why we stopped, record
+            # lessons. This runs inside a try/except so a reflection failure
+            # never blocks the halt from completing.
+            try:
+                self._reflect_on_halt(
+                    cycle_id=cycle_id,
+                    ticker=ticker,
+                    halt_reason=halt_reason,
+                    equity_before=equity_before,
+                )
+            except Exception as exc:
+                logger.error("halt reflection failed: %s", exc)
+
             self.store.complete_cycle(
                 cycle_id,
                 status="halted",
@@ -746,6 +760,83 @@ class TradingLoop:
 
         return results
 
+    def _reflect_on_halt(
+        self, cycle_id: int, ticker: str, halt_reason: str, equity_before: float | None
+    ) -> None:
+        """Trigger a reflection on why the halt happened — what went wrong, and
+        how to avoid repeating it.
+
+        Called from the halt branch in ``run_once`` so every guardrail stop
+        generates a halt analysis + lesson in the DB and memory log, turning
+        the halt from a "skip this cycle" into a "forced learning opportunity".
+        """
+        broker = self.get_broker()
+
+        # Gather recent orders for context
+        recent_orders = self.store.list_orders(limit=10)
+        recent_trades = [
+            o for o in recent_orders if o.get("status") == "filled"
+        ]
+        trades_summary = ""
+        if recent_trades:
+            lines = []
+            for t in recent_trades[:5]:
+                sym = t.get("symbol", "?")
+                act = t.get("action", "?")
+                p = t.get("price", "?")
+                s = t.get("status", "?")
+                lines.append(f"  {act} {sym} @ {p} ({s})")
+            trades_summary = "Recent trades:\n" + "\n".join(lines)
+
+        prompt_body = (
+            f"Halt triggered: {halt_reason}\n"
+            f"Equity before halt: {equity_before}\n"
+            f"Ticker: {ticker}\n\n"
+            f"{trades_summary}"
+        )
+
+        analysis_text = "(LLM unavailable — analysis skipped)"
+        lessons = None
+        llm = self._get_reflection_llm()
+        if llm is not None:
+            try:
+                from langchain_core.messages import HumanMessage, SystemMessage
+
+                msg = llm.invoke([
+                    SystemMessage(content=self._HALT_REFLECTION_PROMPT),
+                    HumanMessage(content=prompt_body),
+                ])
+                analysis_text = msg.content if hasattr(msg, "content") else str(msg)
+                sentences = [s.strip() for s in analysis_text.split(".") if s.strip()]
+                lessons = sentences[-1] + "." if sentences else analysis_text
+            except Exception as exc:
+                logger.error("halt reflection LLM call failed: %s", exc)
+                analysis_text = f"(LLM halt reflection failed: {exc})"
+
+        # Store in halt_events table
+        self.store.record_halt_event(
+            cycle_id=cycle_id,
+            ticker=ticker,
+            reason=halt_reason,
+            equity_before=equity_before,
+            analysis_text=analysis_text,
+            lessons=lessons,
+        )
+
+        # Append to trading memory log
+        if lessons:
+            self._append_trade_lesson_to_memory(
+                ticker=ticker,
+                action="HALT",
+                sym=to_ccxt_symbol(ticker) if ticker else "",
+                pnl_pct=None,
+                lessons=lessons,
+            )
+
+        logger.warning(
+            "halt reflection recorded for cycle %d: %s", cycle_id, halt_reason
+        )
+
     def _get_reflection_llm(self):
         """Return the LLM to use for trade reflection.
 
@@ -764,6 +855,20 @@ class TradingLoop:
     # ------------------------------------------------------------------ #
     # Hold-decision reflection — learning from the trades we did NOT make
     # ------------------------------------------------------------------ #
+
+    _HALT_REFLECTION_PROMPT = (
+        "You are a trading agent reviewing a forced halt event. The runner "
+        "automatically stopped all trading equity dropped below a risk threshold.\n"
+        "Write 3-5 sentences of plain prose (no bullets, no headers, no markdown).\n\n"
+        "Cover in order:\n"
+        "1. What caused the halt? (daily loss limit, max drawdown, or both)\n"
+        "2. Did the recent trades contribute to this drawdown, and if so how?\n"
+        "3. Is this likely a strategy failure, a market regime change, or normal "
+        "variance under leverage?\n"
+        "4. One concrete, actionable rule to avoid repeating this drawdown pattern.\n\n"
+        "Be specific and honest. Your output will be stored and re-read by "
+        "future analysis runs, so every word must earn its place."
+    )
 
     _HOLD_REFLECTION_PROMPT = (
         "You are a trading agent reviewing a decision to NOT trade (HOLD), "
