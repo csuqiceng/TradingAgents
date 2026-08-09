@@ -300,7 +300,11 @@ class ScalperLoop:
                 closes = [row[4] for row in btc_ohlcv]
                 highs = [row[2] for row in btc_ohlcv]
                 lows = [row[3] for row in btc_ohlcv]
+                old_regime = self.regime.get()
                 regime = self.regime.update(closes, highs, lows)
+                if regime != old_regime:
+                    self.store.record_regime(regime)
+                    logger.info("market regime: %s -> %s", old_regime or "?", regime)
             else:
                 regime = self.regime.get()
         except Exception as exc:  # noqa: BLE001
