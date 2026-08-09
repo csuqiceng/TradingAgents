@@ -124,9 +124,18 @@ class MarketRegime:
         return self._cache.regime
 
 
-def get_params(symbol: str, regime: str) -> dict[str, float]:
-    """Return the active SL/TP/trailing params for a symbol under a regime."""
+def get_params(symbol: str, regime: str, overrides: dict | None = None) -> dict[str, float]:
+    """Return the active SL/TP/trailing params for a symbol under a regime.
+
+    ``overrides`` (optional) is a nested dict ``{regime: {symbol: {key: val}}}``
+    applied on top of the static table — used by the running loop to hot-apply
+    DeepSeek-driven adjustments without a restart.
+    """
     params = REGIME_PARAMS.get(regime, {}).get(symbol)
     if params is None:
-        return dict(_DEFAULT_PARAMS)
-    return dict(params)
+        params = _DEFAULT_PARAMS
+    merged = dict(params)
+    ov = (overrides or {}).get(regime, {}).get(symbol)
+    if ov:
+        merged.update(ov)
+    return merged

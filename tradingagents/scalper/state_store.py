@@ -67,6 +67,13 @@ class ScalperStore:
                     ts REAL NOT NULL,
                     regime TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS scalper_ai_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    summary TEXT,
+                    params TEXT,
+                    source TEXT
+                );
                 """
             )
 
@@ -209,6 +216,22 @@ class ScalperStore:
                 "SELECT * FROM scalper_trades ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def closes_since(self, ts: float) -> list[dict]:
+        """Closed (action='close') trades strictly after ``ts``."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM scalper_trades WHERE action='close' AND ts > ? ORDER BY ts",
+                (ts,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_ai_log(self, summary: str, params: dict, source: str = "deepseek") -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO scalper_ai_log (ts, summary, params, source) VALUES (?, ?, ?, ?)",
+                (time.time(), summary, json.dumps(params, ensure_ascii=False), source),
+            )
 
     def close(self) -> None:
         with self._lock:

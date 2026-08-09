@@ -91,6 +91,61 @@ class ScalperLoop:
         self.regime = MarketRegime(cache_seconds=self.config.regime_cache_seconds)
         self.ct_val_cache: dict[str, float] = {}
         self.lot_sz_cache: dict[str, float] = {}
+        self.ai_overrides: dict[str, dict[str, dict[str, float]]] = {}
+        self._ai_loaded_at = 0.0
+
+    # ------------------------------------------------------------------ #
+    # AI-driven hot reload
+    # ------------------------------------------------------------------ #
+
+    def refresh_ai_config(self, force: bool = False) -> None:
+        """Hot-apply DeepSeek adjustments written to the store (checked at
+        most every 60s so the 5s loop stays cheap).
+
+        Two namespaces:
+        - ``strategy.*`` / ``risk.*``  → live config objects
+        - ``regime.<regime>.<symbol>.<key>`` → get_params overrides
+        """
+        now = time.time()
+        if not force and now - self._ai_loaded_at < 60.0:
+            return
+        self._ai_loaded_at = now
+        raw = self.store.get_state("ai_config", "")
+        if not raw:
+            return
+        try:
+            cfg = json.loads(raw)
+        except ValueError:
+            return
+        params = cfg.get("params") or {}
+        if not params:
+            return
+
+        strategy_cfg = self.strategy.config
+        overrides: dict[str, dict[str, dict[str, float]]] = {}
+        changed: list[str] = []
+        for path, val in params.items():
+            try:
+                val = float(val)
+            except (TypeError, ValueError):
+                continue
+            if path.startswith("strategy."):
+                attr = path.split(".", 1)[1]
+                if hasattr(strategy_cfg, attr):
+                    setattr(strategy_cfg, attr, val)
+                    changed.append(path)
+            elif path.startswith("risk."):
+                attr = path.split(".", 1)[1]
+                if hasattr(self.config, attr):
+                    setattr(self.config, attr, val)
+                    changed.append(path)
+            elif path.startswith("regime."):
+                _, regime, sym, key = path.split(".", 3)
+                overrides.setdefault(regime, {}).setdefault(sym, {})[key] = val
+                changed.append(path)
+        if changed:
+            self.ai_overrides = overrides
+            logger.info("AI 调参热加载: %s", ", ".join(changed))
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -238,7 +293,7 @@ class ScalperLoop:
             return
 
         regime = self.regime.get()
-        params = get_params(symbol, regime)
+        params = get_params(symbol, regime, self.ai_overrides)
         try:
             self.broker.set_leverage(ccxt_symbol, pos_side=direction)
         except Exception as exc:  # noqa: BLE001
@@ -291,6 +346,12 @@ class ScalperLoop:
     def run_once(self) -> None:
         """One scan of all symbols (called repeatedly by the loop)."""
         cfg = self.config
+
+        # Hot-apply DeepSeek parameter adjustments (checked <= every 60s).
+        try:
+            self.refresh_ai_config()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("refresh_ai_config failed: %s", exc)
 
         # Pause gate (consecutive losses).
         paused_until = self.store.paused_until()
