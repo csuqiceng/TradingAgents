@@ -83,6 +83,7 @@ def main() -> None:
     broker = _build_broker()
     config = ScalperConfig(
         interval_seconds=float(os.environ.get("TRADINGAGENTS_SCALPER_INTERVAL", "5")),
+        notional_capital=float(os.environ.get("TRADINGAGENTS_SCALPER_NOTIONAL_CAPITAL", "160")),
     )
     if len(sys.argv) > 1 and sys.argv[1] == "once":
         # Single scan (testing): build store + run one pass.

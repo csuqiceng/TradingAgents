@@ -69,6 +69,7 @@ class ScalperConfig:
         self.pause_minutes = 90
         self.fee_rate = 0.001
         self.leverage = 5
+        self.notional_capital = 160.0     # 名义资金：按实盘 160 USDT 规模模拟（不用模拟盘余额）
         self.interval_seconds = 5.0
         self.regime_cache_seconds = 1800.0
         for k, v in overrides.items():
@@ -221,8 +222,10 @@ class ScalperLoop:
             except Exception as exc:  # noqa: BLE001
                 logger.error("contract_size failed for %s: %s", symbol, exc)
                 return
-        contracts = self.broker.calc_contracts(margin, price, ct_val)
+        contracts = self.broker.calc_contracts(margin, price, ct_val, self.config.leverage)
         if contracts <= 0:
+            logger.info("   ⏸ %s: margin %.2f 不够 1 张（名义 %.2f），跳过",
+                        symbol, margin, price * ct_val)
             return
 
         regime = self.regime.get()
@@ -287,7 +290,10 @@ class ScalperLoop:
             return
 
         try:
-            equity = self.broker.fetch_equity()
+            equity = self.config.notional_capital
+            if equity <= 0:
+                # 未配置名义资金时回退到账户真实权益
+                equity = self.broker.fetch_equity()
         except Exception as exc:  # noqa: BLE001
             logger.error("fetch_equity failed: %s", exc)
             return
@@ -371,30 +377,40 @@ class ScalperLoop:
 
 
 def run_forever(config: ScalperConfig | None = None, broker: SwapBroker | None = None) -> None:
-    """Entry point: build the broker/store and loop forever."""
-    from tradingagents.dataflows.config import get_config
+    """Entry point: build the broker/store and loop forever.
+
+    Credentials always come from the dedicated scalper (simulated) env vars
+    ``TRADINGAGENTS_SCALPER_*`` — never the live spot keys. If no broker is
+    passed, one is built here from those env vars; a missing key is a hard
+    error (no silent fallback to live credentials).
+    """
     cfg = config or ScalperConfig()
 
-    # Reuse the project's dataflow config for credentials (never touch .env
-    # of the AI runner; scalper reads the same config source but only uses
-    # the swap-relevant keys).
-    project_cfg = get_config()
-    import ccxt
-
-    exchange = ccxt.okx({
-        "apiKey": project_cfg.get("crypto_api_key"),
-        "secret": project_cfg.get("crypto_secret"),
-        "password": project_cfg.get("crypto_passphrase"),
-        "enableRateLimit": True,
-    })
-    https_proxy = project_cfg.get("crypto_https_proxy")
-    if https_proxy:
-        exchange.proxies = {"http": https_proxy, "https": https_proxy}
-
     if broker is None:
+        import ccxt
+
+        api_key = os.environ.get("TRADINGAGENTS_SCALPER_API_KEY", "")
+        secret = os.environ.get("TRADINGAGENTS_SCALPER_SECRET", "")
+        passphrase = os.environ.get("TRADINGAGENTS_SCALPER_PASSPHRASE", "")
+        if not (api_key and secret and passphrase):
+            raise SystemExit(
+                "Refusing to start scalper without explicit simulated credentials. "
+                "Set TRADINGAGENTS_SCALPER_API_KEY/SECRET/PASSPHRASE in .env."
+            )
+        exchange = ccxt.okx({
+            "apiKey": api_key,
+            "secret": secret,
+            "password": passphrase,
+            "enableRateLimit": True,
+        })
+        proxy = os.environ.get("TRADINGAGENTS_SCALPER_PROXY", "http://127.0.0.1:7897")
+        if proxy:
+            exchange.proxies = {"http": proxy, "https": proxy}
         broker = SwapBroker(exchange, leverage=cfg.leverage, sandbox=True)
 
-    store = ScalperStore(project_cfg.get("scalper_state_path", "/root/.tradingagents/cache/runner_scalper.db"))
+    store = ScalperStore(
+        os.environ.get("TRADINGAGENTS_SCALPER_DB_PATH", "/root/.tradingagents/cache/runner_scalper.db")
+    )
     loop = ScalperLoop(broker, store, cfg)
 
     # Idempotent account setup.

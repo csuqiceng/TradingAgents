@@ -128,17 +128,19 @@ class SwapBroker:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def calc_contracts(usdt_margin: float, price: float, ct_val: float) -> int:
-        """Lots = margin / (price * ctVal), minimum 1.
+    def calc_contracts(usdt_margin: float, price: float, ct_val: float, leverage: int = 1) -> int:
+        """Lots = margin * leverage / (price * ctVal), rounded down; 0 if < 1 lot.
 
-        Matches the legacy strategy's (conservative) sizing — the comment in
-        the old code claimed leverage was included, the code did not; we keep
-        the actual behaviour that was running and validated on paper.
+        ``usdt_margin`` is the *margin* budget; the notional exposure is
+        margin * leverage (5x default). If the budget cannot buy even one
+        contract, return 0 so the caller skips the symbol — never force a
+        1-lot open (that would silently blow past the margin budget, e.g.
+        16 USDT trying to hold 1 BTC contract = ~40x effective leverage).
         """
-        if price <= 0 or ct_val <= 0 or usdt_margin <= 0:
+        if price <= 0 or ct_val <= 0 or usdt_margin <= 0 or leverage <= 0:
             return 0
-        contracts = usdt_margin / (price * ct_val)
-        return max(1, int(contracts))
+        contracts = usdt_margin * leverage / (price * ct_val)
+        return int(contracts)
 
     def open_position(
         self,

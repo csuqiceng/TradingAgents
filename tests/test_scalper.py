@@ -256,15 +256,22 @@ class TestSwapBroker:
         assert ex.leverage_calls == [(5, "BTC/USDT:USDT", {"mgnMode": "cross", "posSide": "long"})]
 
     def test_calc_contracts_btc(self):
-        # BTC: ctVal=0.01 → lots = margin / (price * 0.01), floor 1 lot.
-        assert SwapBroker.calc_contracts(100.0, 65000.0, 0.01) == 1  # 100/650 ≈ 0.15 → floor 1
-        assert SwapBroker.calc_contracts(700.0, 65000.0, 0.01) == 1  # 700/650 ≈ 1.07 → 1
-        assert SwapBroker.calc_contracts(1500.0, 65000.0, 0.01) == 2  # 1500/650 ≈ 2.3 → 2
+        # BTC: ctVal=0.01 → lots = margin*lev / (price * 0.01), floor 0.
+        assert SwapBroker.calc_contracts(100.0, 65000.0, 0.01, 5) == 0  # 500/650 < 1 → 0
+        assert SwapBroker.calc_contracts(700.0, 65000.0, 0.01, 5) == 5  # 3500/650 ≈ 5.4 → 5
+        assert SwapBroker.calc_contracts(1500.0, 65000.0, 0.01, 5) == 11  # 7500/650 ≈ 11.5 → 11
 
     def test_calc_contracts_sol(self):
-        # SOL: ctVal=1 → lots = margin / price
-        assert SwapBroker.calc_contracts(80.0, 76.0, 1.0) == 1
-        assert SwapBroker.calc_contracts(1000.0, 76.0, 1.0) == 13
+        # SOL: ctVal=1 → lots = margin*lev / price
+        assert SwapBroker.calc_contracts(80.0, 76.0, 1.0, 5) == 5
+        assert SwapBroker.calc_contracts(1000.0, 76.0, 1.0, 5) == 65
 
-    def test_calc_contracts_floor_one(self):
-        assert SwapBroker.calc_contracts(1000.0, 65000.0, 0.01) == 1  # 1.5 → 1 (int floor)
+    def test_calc_contracts_insufficient_budget(self):
+        # 预算不够 1 张必须返回 0（绝不能强开 1 张超出保证金预算）
+        assert SwapBroker.calc_contracts(16.0, 64866.0, 0.01, 5) == 0  # BTC 1 张名义 648
+        assert SwapBroker.calc_contracts(16.0, 1920.0, 0.1, 5) == 0    # ETH 1 张名义 192
+        assert SwapBroker.calc_contracts(16.0, 76.0, 1.0, 5) == 1      # SOL 1 张名义 76 开得起
+
+    def test_calc_contracts_floor_zero_no_force(self):
+        # 0 < lots < 1 → 0，而不是强开 1 张（避免实际杠杆远超设定）
+        assert SwapBroker.calc_contracts(100.0, 65000.0, 0.01, 5) == 0
