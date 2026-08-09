@@ -298,6 +298,20 @@ def build_report(report_date: dt.date, trades: list[dict], decisions: list[dict]
     L.append(f"📅 日期：{report_date.isoformat()}（北京时间）")
     L.append("")
 
+    # ---- 0. 双系统收益率总览 ----
+    L.append("━━━ 收益率总览 ━━━")
+    spot_ret = None
+    if equity_start is not None and equity_end is not None and equity_start > 0:
+        spot_ret = (equity_end - equity_start) / equity_start * 100.0
+    spot_ret_str = f"{spot_ret:+.2f}%" if spot_ret is not None else "N/A"
+    L.append(f"🟢 现货(实盘)：{spot_ret_str}")
+    if scalper is not None and scalper.get("notional_capital", 0) > 0:
+        s = scalper
+        notional = s["notional_capital"]
+        ret = (s.get("realized_pnl", 0.0) + s.get("unrealized_pnl", 0.0)) / notional * 100.0
+        L.append(f"🔴 杠杆(模拟盘5x)：{ret:+.2f}%")
+    L.append("")
+
     # ---- 1. 交易记录 ----
     L.append("━━━ ① 现货今日交易记录 ━━━")
     if not trades:
@@ -468,12 +482,15 @@ def main() -> int:
         sdb = scalper_db()
         scalper_closes = load_scalper_trades(sdb, start_ts, end_ts)
         realized = sum(float(c.get("pnl_usdt") or 0.0) for c in scalper_closes)
-        # 当前持仓浮盈（模拟盘实时查询）
+        # 当前持仓浮盈（模拟盘实时查询，只统计 SWAP 永续合约，排除现货 MARGIN 遗留仓）
         unrealized = 0.0
         try:
             sbroker = load_scalper_broker()
             spos = sbroker.exchange.fetch_positions()
             for p in spos:
+                info = p.get("info", {}) or {}
+                if info.get("instType") != "SWAP":
+                    continue
                 upl = float(p.get("unrealizedPnl") or 0.0)
                 unrealized += upl
         except Exception as exc:
