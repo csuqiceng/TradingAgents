@@ -56,6 +56,57 @@ def load_broker() -> CryptoBroker:
     )
 
 
+def load_scalper_broker() -> CryptoBroker:
+    """OKX 模拟盘 broker（杠杆 scalper 专用凭据，硬编码 sandbox）。
+
+    只读用途：日报查询模拟盘权益与持仓浮盈。
+    """
+    import re
+    env = {}
+    try:
+        for ln in open(os.path.join(os.path.dirname(__file__), ".env"), encoding="utf-8"):
+            ln = ln.strip()
+            if ln and not ln.startswith("#") and "=" in ln:
+                k, v = ln.split("=", 1)
+                env[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return CryptoBroker(
+        exchange_id="okx",
+        api_key=env.get("TRADINGAGENTS_SCALPER_API_KEY"),
+        secret=env.get("TRADINGAGENTS_SCALPER_SECRET"),
+        passphrase=env.get("TRADINGAGENTS_SCALPER_PASSPHRASE"),
+        https_proxy=env.get("TRADINGAGENTS_SCALPER_PROXY") or "http://127.0.0.1:7897",
+        testnet=True,  # 模拟盘：x-simulated-trading header
+        quote_budget=1000.0,
+        max_position_fraction=0.2,
+        cooldown_seconds=14400.0,
+    )
+
+
+def scalper_db() -> sqlite3.Connection:
+    db_path = os.environ.get(
+        "TRADINGAGENTS_SCALPER_DB_PATH",
+        os.path.join(
+            DEFAULT_CONFIG.get("data_cache_dir", os.path.expanduser("~/.tradingagents/cache")),
+            "runner_scalper.db",
+        ),
+    )
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def load_scalper_trades(db: sqlite3.Connection, day_start_ts: float, day_end_ts: float) -> list[dict]:
+    """当日杠杆平仓记录（已实现盈亏）。"""
+    rows = db.execute(
+        "SELECT ts, symbol, side, action, price, contracts, margin, pnl_usdt, pnl_pct, reason "
+        "FROM scalper_trades WHERE action='close' AND ts >= ? AND ts < ? ORDER BY ts",
+        (day_start_ts, day_end_ts),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def local_db() -> sqlite3.Connection:
     db_path = DEFAULT_CONFIG.get("runner_db_path") or os.path.join(
         DEFAULT_CONFIG.get("data_cache_dir", os.path.expanduser("~/.tradingagents/cache")),
@@ -239,7 +290,8 @@ def extract_decision_summary(decision_md: str | None) -> str:
 
 def build_report(report_date: dt.date, trades: list[dict], decisions: list[dict],
                  orders: list[dict], pnl: dict, equity_start: float | None,
-                 equity_end: float | None) -> str:
+                 equity_end: float | None,
+                 scalper: dict | None = None) -> str:
     """拼装 Markdown 报告文本。"""
     L: list[str] = []
     L.append(f"📊 TradingAgents-BTC 每日交易报告")
@@ -247,7 +299,7 @@ def build_report(report_date: dt.date, trades: list[dict], decisions: list[dict]
     L.append("")
 
     # ---- 1. 交易记录 ----
-    L.append("━━━ ① 今日交易记录 ━━━")
+    L.append("━━━ ① 现货今日交易记录 ━━━")
     if not trades:
         L.append("今日无成交。")
     else:
@@ -282,6 +334,33 @@ def build_report(report_date: dt.date, trades: list[dict], decisions: list[dict]
     if equity_start is not None and equity_end is not None:
         eq_delta = equity_end - equity_start
         L.append(f"账户权益：{equity_start:,.2f} → {equity_end:,.2f} USDT（{eq_delta:+,.2f}）")
+    L.append("")
+
+    # ---- 2.5 杠杆 scalper（模拟盘，名义资金） ----
+    L.append("━━━ ② 杠杆 Scalper（模拟盘 5x）━━━")
+    if scalper is None:
+        L.append("（杠杆数据不可用）")
+    else:
+        s = scalper
+        notional = s.get("notional_capital", 160.0)
+        realized = s.get("realized_pnl", 0.0)
+        unrealized = s.get("unrealized_pnl", 0.0)
+        n_trades = s.get("n_trades", 0)
+        ret_realized = realized / notional * 100.0 if notional else 0.0
+        ret_total = (realized + unrealized) / notional * 100.0 if notional else 0.0
+        L.append(f"名义资金：{notional:.0f} USDT（模拟） | 当日平仓 {n_trades} 笔")
+        L.append(f"已实现盈亏：**{realized:+,.2f} USDT（{ret_realized:+.2f}%）**")
+        if unrealized:
+            L.append(f"当前持仓浮盈：{unrealized:+,.2f} USDT（{unrealized/notional*100:+.2f}%）")
+        if n_trades and s.get("closes"):
+            L.append("")
+            L.append("平仓明细：")
+            for c in s["closes"][:20]:
+                ts = dt.datetime.fromtimestamp(c["ts"], tz=TZ_CST).strftime("%H:%M:%S")
+                mark = "🟢" if c["pnl_usdt"] >= 0 else "🔴"
+                L.append(f"  {mark} `{ts}` {c['symbol']} {c['side']} {c['contracts']}张 "
+                         f"{c['pnl_usdt']:+.2f} USDT（{c['pnl_pct']:+.2f}%）{c.get('reason','')}")
+        L.append(f"合计收益率：**{ret_total:+.2f}%**（已实现 {ret_realized:+.2f}% + 浮盈）")
     L.append("")
 
     # ---- 3. 为什么这么交易 ----
@@ -382,7 +461,38 @@ def main() -> int:
             logger.warning("实时权益获取失败: %s", exc)
 
     pnl = summarize_pnl(trades)
-    report = build_report(report_date, trades, decisions, orders, pnl, equity_start, equity_end)
+
+    # ---- 杠杆 scalper 数据 ----
+    scalper_data: dict | None = None
+    try:
+        sdb = scalper_db()
+        scalper_closes = load_scalper_trades(sdb, start_ts, end_ts)
+        realized = sum(float(c.get("pnl_usdt") or 0.0) for c in scalper_closes)
+        # 当前持仓浮盈（模拟盘实时查询）
+        unrealized = 0.0
+        try:
+            sbroker = load_scalper_broker()
+            spos = sbroker.exchange.fetch_positions()
+            for p in spos:
+                upl = float(p.get("unrealizedPnl") or 0.0)
+                unrealized += upl
+        except Exception as exc:
+            logger.warning("杠杆浮盈获取失败: %s", exc)
+        notional = float(os.environ.get("TRADINGAGENTS_SCALPER_NOTIONAL_CAPITAL", "160"))
+        scalper_data = {
+            "notional_capital": notional,
+            "realized_pnl": realized,
+            "unrealized_pnl": unrealized,
+            "n_trades": len(scalper_closes),
+            "closes": scalper_closes,
+        }
+        logger.info("杠杆 scalper: 平仓 %d 笔，已实现 %+.2f，浮盈 %+.2f",
+                    len(scalper_closes), realized, unrealized)
+    except Exception as exc:
+        logger.warning("杠杆 scalper 数据加载失败: %s", exc)
+
+    report = build_report(report_date, trades, decisions, orders, pnl, equity_start, equity_end,
+                          scalper=scalper_data)
 
     print("\n" + "=" * 60)
     print(report)
