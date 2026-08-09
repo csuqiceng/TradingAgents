@@ -85,6 +85,16 @@ class SwapBroker:
         market = self.exchange.market(symbol)
         return float(market.get("contractSize") or market.get("info", {}).get("ctVal") or 1.0)
 
+    def lot_size(self, symbol: str) -> float:
+        """Minimum order size (lotSz) for a swap market, default 0.01."""
+        market = self.exchange.market(symbol)
+        info = market.get("info", {}) or {}
+        lot_sz = info.get("lotSz") or market.get("limits", {}).get("amount", {}).get("min")
+        try:
+            return float(lot_sz)
+        except (TypeError, ValueError):
+            return 0.01
+
     def fetch_price(self, symbol: str) -> float:
         ticker = self.exchange.fetch_ticker(symbol)
         last = ticker.get("last")
@@ -128,25 +138,31 @@ class SwapBroker:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def calc_contracts(usdt_margin: float, price: float, ct_val: float, leverage: int = 1) -> int:
-        """Lots = margin * leverage / (price * ctVal), rounded down; 0 if < 1 lot.
+    def calc_contracts(
+        usdt_margin: float,
+        price: float,
+        ct_val: float,
+        leverage: int = 1,
+        lot_sz: float = 0.01,
+    ) -> float:
+        """Lots = margin * leverage / (price * ctVal), floored to lot_sz grid.
 
-        ``usdt_margin`` is the *margin* budget; the notional exposure is
-        margin * leverage (5x default). If the budget cannot buy even one
-        contract, return 0 so the caller skips the symbol — never force a
-        1-lot open (that would silently blow past the margin budget, e.g.
-        16 USDT trying to hold 1 BTC contract = ~40x effective leverage).
+        OKX swaps support fractional contracts (lotSz=0.01); we size the
+        notional exactly from the margin budget and round *down* to the
+        lot-size grid so the order is always valid. Returns 0 when the
+        budget cannot even afford one lot (caller skips the symbol).
         """
-        if price <= 0 or ct_val <= 0 or usdt_margin <= 0 or leverage <= 0:
-            return 0
+        if price <= 0 or ct_val <= 0 or usdt_margin <= 0 or leverage <= 0 or lot_sz <= 0:
+            return 0.0
         contracts = usdt_margin * leverage / (price * ct_val)
-        return int(contracts)
+        lots = int(contracts / lot_sz) * lot_sz
+        return round(lots, 6)
 
     def open_position(
         self,
         symbol: str,
         side: str,  # "long" | "short"
-        contracts: int,
+        contracts: float,
         price: float,
         sl_pct: float,
         tp_pct: float,
@@ -196,7 +212,7 @@ class SwapBroker:
             "tp_px": tp_px,
         }
 
-    def close_position(self, symbol: str, side: str, contracts: int) -> dict[str, Any]:
+    def close_position(self, symbol: str, side: str, contracts: float) -> dict[str, Any]:
         """Close a position (reduceOnly) at market."""
         order_side = "sell" if side == "long" else "buy"
         order = self.exchange.create_order(

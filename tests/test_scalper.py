@@ -256,22 +256,28 @@ class TestSwapBroker:
         assert ex.leverage_calls == [(5, "BTC/USDT:USDT", {"mgnMode": "cross", "posSide": "long"})]
 
     def test_calc_contracts_btc(self):
-        # BTC: ctVal=0.01 → lots = margin*lev / (price * 0.01), floor 0.
-        assert SwapBroker.calc_contracts(100.0, 65000.0, 0.01, 5) == 0  # 500/650 < 1 → 0
-        assert SwapBroker.calc_contracts(700.0, 65000.0, 0.01, 5) == 5  # 3500/650 ≈ 5.4 → 5
-        assert SwapBroker.calc_contracts(1500.0, 65000.0, 0.01, 5) == 11  # 7500/650 ≈ 11.5 → 11
+        # BTC: ctVal=0.01 → lots = margin*lev / (price * 0.01), floored to lotSz 0.01
+        assert SwapBroker.calc_contracts(16.0, 65000.0, 0.01, 5) == pytest.approx(0.12)  # 80/650=0.123
+        assert SwapBroker.calc_contracts(700.0, 65000.0, 0.01, 5) == pytest.approx(5.38)  # 3500/650=5.38
+        assert SwapBroker.calc_contracts(1500.0, 65000.0, 0.01, 5) == pytest.approx(11.53)
 
     def test_calc_contracts_sol(self):
         # SOL: ctVal=1 → lots = margin*lev / price
-        assert SwapBroker.calc_contracts(80.0, 76.0, 1.0, 5) == 5
-        assert SwapBroker.calc_contracts(1000.0, 76.0, 1.0, 5) == 65
+        assert SwapBroker.calc_contracts(80.0, 76.0, 1.0, 5) == pytest.approx(5.26)
+        assert SwapBroker.calc_contracts(1000.0, 76.0, 1.0, 5) == pytest.approx(65.78)
 
-    def test_calc_contracts_insufficient_budget(self):
-        # 预算不够 1 张必须返回 0（绝不能强开 1 张超出保证金预算）
-        assert SwapBroker.calc_contracts(16.0, 64866.0, 0.01, 5) == 0  # BTC 1 张名义 648
-        assert SwapBroker.calc_contracts(16.0, 1920.0, 0.1, 5) == 0    # ETH 1 张名义 192
-        assert SwapBroker.calc_contracts(16.0, 76.0, 1.0, 5) == 1      # SOL 1 张名义 76 开得起
+    def test_calc_contracts_small_budget(self):
+        # 160 USDT 预算下三个币都能开（0.01 张精度）
+        assert SwapBroker.calc_contracts(16.0, 64866.0, 0.01, 5) == pytest.approx(0.12)  # BTC 0.12 张
+        assert SwapBroker.calc_contracts(16.0, 1920.0, 0.1, 5) == pytest.approx(0.41)    # ETH 0.41 张
+        assert SwapBroker.calc_contracts(16.0, 76.0, 1.0, 5) == pytest.approx(1.05)      # SOL 1.05 张
 
-    def test_calc_contracts_floor_zero_no_force(self):
-        # 0 < lots < 1 → 0，而不是强开 1 张（避免实际杠杆远超设定）
-        assert SwapBroker.calc_contracts(100.0, 65000.0, 0.01, 5) == 0
+    def test_calc_contracts_budget_below_one_lot(self):
+        # 预算不够 0.01 张 → 0（如 1 USDT 开 BTC）
+        assert SwapBroker.calc_contracts(1.0, 65000.0, 0.01, 5) == 0
+        assert SwapBroker.calc_contracts(0.01, 65000.0, 0.01, 5) == 0
+
+    def test_calc_contracts_custom_lot_sz(self):
+        # 自定义 lotSz（如 0.1）时按该精度向下取整
+        assert SwapBroker.calc_contracts(16.0, 1920.0, 0.1, 5, lot_sz=0.1) == pytest.approx(0.4)
+        assert SwapBroker.calc_contracts(16.0, 1920.0, 0.1, 5, lot_sz=1.0) == 0.0

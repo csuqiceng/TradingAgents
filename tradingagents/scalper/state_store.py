@@ -32,7 +32,7 @@ class ScalperStore:
                 CREATE TABLE IF NOT EXISTS scalper_positions (
                     symbol TEXT PRIMARY KEY,
                     side TEXT NOT NULL,
-                    contracts INTEGER NOT NULL,
+                    contracts REAL NOT NULL,
                     entry_price REAL NOT NULL,
                     margin REAL NOT NULL,
                     entry_time REAL NOT NULL,
@@ -56,7 +56,7 @@ class ScalperStore:
                     side TEXT NOT NULL,
                     action TEXT NOT NULL,
                     price REAL NOT NULL,
-                    contracts INTEGER NOT NULL,
+                    contracts REAL NOT NULL,
                     margin REAL,
                     pnl_usdt REAL,
                     pnl_pct REAL,

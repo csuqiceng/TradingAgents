@@ -90,6 +90,7 @@ class ScalperLoop:
         self.strategy = strategy or ScalpStrategy()
         self.regime = MarketRegime(cache_seconds=self.config.regime_cache_seconds)
         self.ct_val_cache: dict[str, float] = {}
+        self.lot_sz_cache: dict[str, float] = {}
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -160,7 +161,7 @@ class ScalperLoop:
     def _close_position(self, symbol: str, pos: dict, price: float, reason: str, regime: str) -> None:
         ccxt_symbol = self._symbol_to_ccxt(symbol)
         try:
-            self.broker.close_position(ccxt_symbol, pos["side"], int(pos["contracts"]))
+            self.broker.close_position(ccxt_symbol, pos["side"], float(pos["contracts"]))
         except Exception as exc:  # noqa: BLE001
             logger.error("close failed for %s: %s", symbol, exc)
             return
@@ -222,7 +223,15 @@ class ScalperLoop:
             except Exception as exc:  # noqa: BLE001
                 logger.error("contract_size failed for %s: %s", symbol, exc)
                 return
-        contracts = self.broker.calc_contracts(margin, price, ct_val, self.config.leverage)
+        lot_sz = self.lot_sz_cache.get(symbol)
+        if lot_sz is None:
+            try:
+                lot_sz = self.broker.lot_size(ccxt_symbol)
+                self.lot_sz_cache[symbol] = lot_sz
+            except Exception as exc:  # noqa: BLE001
+                logger.error("lot_size failed for %s: %s", symbol, exc)
+                return
+        contracts = self.broker.calc_contracts(margin, price, ct_val, self.config.leverage, lot_sz)
         if contracts <= 0:
             logger.info("   ⏸ %s: margin %.2f 不够 1 张（名义 %.2f），跳过",
                         symbol, margin, price * ct_val)
