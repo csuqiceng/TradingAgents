@@ -73,6 +73,47 @@ def to_ccxt_symbol(symbol: str) -> str:
     return f"{base}/USDT"
 
 
+def _friendly_reason(exc: Exception, max_len: int = 220) -> str:
+    """Turn an exchange exception into a short, human-readable reason.
+
+    ccxt exceptions embed the raw OKX JSON payload in ``str(exc)``, e.g.
+    ``{"code":"1","data":[{"sCode":"51020","sMsg":"Your order should
+    meet or exceed the minimum order amount.",...}],...}``. That blob is
+    noise in a chat notification; we extract the first ``sMsg`` (or ``msg``)
+    field, falling back to a truncated raw text when nothing parseable is
+    found. Never raises — best-effort only.
+    """
+    import json as _json
+    import re as _re
+
+    text = str(exc)
+    # 1) Try to parse the whole payload as JSON and walk data[].sMsg.
+    try:
+        payload = _json.loads(text)
+        if isinstance(payload, dict):
+            data = payload.get("data")
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        smsg = item.get("sMsg") or item.get("msg")
+                        if smsg:
+                            return str(smsg)
+            msg = payload.get("msg")
+            if msg:
+                return str(msg)
+    except Exception:
+        pass
+    # 2) Fallback: regex the sMsg / msg field out of embedded JSON text.
+    m = _re.search(r'"sMsg"\s*:\s*"([^"]+)"', text)
+    if not m:
+        m = _re.search(r'"msg"\s*:\s*"([^"]+)"', text)
+    if m:
+        return m.group(1)
+    # 3) Last resort: single-line, truncated raw text.
+    one_line = " ".join(text.split())
+    return one_line if len(one_line) <= max_len else one_line[: max_len - 1] + "…"
+
+
 class CryptoBroker(BaseBroker):
     """ccxt-backed spot crypto broker.
 
@@ -208,7 +249,7 @@ class CryptoBroker(BaseBroker):
             logger.error("Order failed on %s (%s): %s", ccxt_symbol, action, exc)
             return OrderResult(
                 status="error",
-                reason=str(exc),
+                reason=_friendly_reason(exc),
                 action=action,
                 symbol=ccxt_symbol,
             )
@@ -360,7 +401,7 @@ class CryptoBroker(BaseBroker):
             logger.error("Hard stop-loss sell failed on %s: %s", ccxt_symbol, exc)
             return OrderResult(
                 status="error",
-                reason=str(exc),
+                reason=_friendly_reason(exc),
                 action="SELL",
                 symbol=ccxt_symbol,
             )

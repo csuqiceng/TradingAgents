@@ -449,16 +449,19 @@ class TradingLoop:
                 amount = order_result.get("amount")
                 status = order_result.get("status")
                 reason = order_result.get("reason", "")
+                status_icon = "✅" if status == "filled" else "❌"
                 msg = (
-                    f"🤖 TradingAgents\n"
-                    f"{symbol} {action} {status}\n"
+                    f"{status_icon} TradingAgents · {symbol} · {action}"
+                    f"{'成交' if status == 'filled' else '失败'}\n"
+                    "─" * 24 + "\n"
                 )
                 if price and amount:
-                    msg += f"价格: ${price} | 数量: {amount}\n"
+                    msg += f"价格: ${price}\n"
+                    msg += f"数量: {amount}\n"
                     msg += f"金额: ${float(price) * float(amount):.2f}\n"
                 if reason:
                     msg += f"原因: {reason}\n"
-                msg += f"评级: {rating or 'N/A'} | cycle #{cycle_id}"
+                msg += f"评级: {rating or 'N/A'} · 轮次: #{cycle_id}"
                 _feishu_send(msg)
 
         # Post-cycle account snapshot (equity_after).
