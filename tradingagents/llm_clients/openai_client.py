@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -11,6 +12,8 @@ from .api_key_env import get_api_key_env
 from .base_client import BaseLLMClient, normalize_content
 from .capabilities import get_capabilities
 from .validators import validate_model
+
+logger = logging.getLogger(__name__)
 
 
 class NormalizedChatOpenAI(ChatOpenAI):
@@ -126,7 +129,30 @@ class DeepSeekChatOpenAI(NormalizedChatOpenAI):
             reasoning = choice.get("message", {}).get("reasoning_content")
             if reasoning is not None:
                 generation.message.additional_kwargs["reasoning_content"] = reasoning
+        self._log_cache_stats(response_dict)
         return chat_result
+
+    def _log_cache_stats(self, response_dict) -> None:
+        """Log DeepSeek context-cache hit/miss tokens for observability.
+
+        DeepSeek reports ``prompt_cache_hit_tokens`` / ``prompt_cache_miss_tokens``
+        in the top-level usage object. We log them (plus the derived hit rate)
+        at INFO so a run's journal shows whether the prefix-based context
+        cache is actually being hit — the whole point of the cache-friendly
+        prompt layout (static system prefix + dynamic data in user messages).
+        """
+        try:
+            usage = response_dict.get("usage") or {}
+            hit = int(usage.get("prompt_cache_hit_tokens") or 0)
+            miss = int(usage.get("prompt_cache_miss_tokens") or 0)
+            total = hit + miss
+            if total > 0:
+                logger.info(
+                    "deepseek cache: hit=%d miss=%d hit_rate=%.1f%%",
+                    hit, miss, 100.0 * hit / total,
+                )
+        except Exception:  # noqa: BLE001 — observability must never break calls
+            pass
 
 
 class MinimaxChatOpenAI(NormalizedChatOpenAI):

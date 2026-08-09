@@ -28,6 +28,16 @@ from tradingagents.agents.schemas import (
 )
 from tradingagents.agents.trader.trader import create_trader
 
+
+def _prompt_text(prompt) -> str:
+    """Flatten a captured prompt (str, message list, or objects) to text."""
+    if isinstance(prompt, str):
+        return prompt
+    parts = []
+    for m in prompt:
+        parts.append(m.get("content", "") if isinstance(m, dict) else getattr(m, "content", ""))
+    return "\n".join(str(p) for p in parts)
+
 # ---------------------------------------------------------------------------
 # Render functions
 # ---------------------------------------------------------------------------
@@ -271,7 +281,7 @@ class TestResearchManagerAgent:
         llm = _structured_rm_llm(captured)
         rm = create_research_manager(llm)
         rm(_make_rm_state())
-        prompt = captured["prompt"]
+        prompt = _prompt_text(captured["prompt"])
         for tier in ("Buy", "Overweight", "Hold", "Underweight", "Sell"):
             assert f"**{tier}**" in prompt, f"missing {tier} in prompt"
 

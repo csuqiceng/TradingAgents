@@ -23,11 +23,11 @@ def create_research_manager(llm):
 
         investment_debate_state = state["investment_debate_state"]
 
-        prompt = f"""As the Research Manager and debate facilitator, your role is to critically evaluate this round of debate and deliver a clear, actionable investment plan for the trader.
-
-{instrument_context}
-
----
+        # Cache-friendly prompt layout (DeepSeek context caching is prefix-
+        # based): the role + rating scale stay in a static system message so
+        # the cached prefix hits across tickers and cycles. Dynamic data
+        # (instrument context, debate history) goes into a user message.
+        system_prompt = f"""As the Research Manager and debate facilitator, your role is to critically evaluate this round of debate and deliver a clear, actionable investment plan for the trader.
 
 **Rating Scale** (use exactly one):
 - **Buy**: Strong conviction in the bull thesis; recommend taking or growing the position
@@ -38,17 +38,24 @@ def create_research_manager(llm):
 
 Commit to a clear stance whenever the debate's strongest arguments warrant one; reserve Hold for situations where the evidence on both sides is genuinely balanced.
 
+{NO_EXTERNAL_TOOLS}{get_language_instruction()}"""
+
+        user_prompt = f"""{instrument_context}
+
 ---
 
 **Debate History:**
 {history}
 
-{NO_EXTERNAL_TOOLS}""" + get_language_instruction()
+Deliver your investment plan."""
 
         investment_plan = invoke_structured_or_freetext(
             structured_llm,
             llm,
-            prompt,
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
             render_research_plan,
             "Research Manager",
         )

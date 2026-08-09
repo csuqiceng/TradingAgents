@@ -14,6 +14,16 @@ from tradingagents.graph.trading_graph import TradingAgentsGraph
 
 _SEP = TradingMemoryLog._SEPARATOR
 
+
+def _prompt_text(prompt) -> str:
+    """Flatten a captured prompt (str, message list, or objects) to text."""
+    if isinstance(prompt, str):
+        return prompt
+    parts = []
+    for m in prompt:
+        parts.append(m.get("content", "") if isinstance(m, dict) else getattr(m, "content", ""))
+    return "\n".join(str(p) for p in parts)
+
 DECISION_BUY = "Rating: Buy\nEnter at $189-192, 6% portfolio cap."
 DECISION_OVERWEIGHT = (
     "Rating: Overweight\n"
@@ -693,8 +703,9 @@ class TestPortfolioManagerInjection:
         pm_node = create_portfolio_manager(llm)
         state = _make_pm_state(past_context="[2026-01-05 | NVDA | Buy | +5.0% | +2.0% | 5d]\nGreat call.")
         pm_node(state)
-        assert "Lessons from prior decisions and outcomes" in captured["prompt"]
-        assert "Great call." in captured["prompt"]
+        prompt_text = _prompt_text(captured["prompt"])
+        assert "Lessons from prior decisions and outcomes" in prompt_text
+        assert "Great call." in prompt_text
 
     def test_pm_no_past_context_no_section(self):
         """PM prompt omits the lessons section entirely when past_context is empty."""
@@ -703,7 +714,8 @@ class TestPortfolioManagerInjection:
         pm_node = create_portfolio_manager(llm)
         state = _make_pm_state(past_context="")
         pm_node(state)
-        assert "Lessons from prior decisions" not in captured["prompt"]
+        prompt_text = _prompt_text(captured["prompt"])
+        assert "Lessons from prior decisions" not in prompt_text
 
     def test_pm_returns_rendered_markdown_with_rating(self):
         """The structured PortfolioDecision is rendered to markdown that

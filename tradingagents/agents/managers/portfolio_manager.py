@@ -40,11 +40,12 @@ def create_portfolio_manager(llm):
             else ""
         )
 
-        prompt = f"""As the Portfolio Manager, synthesize the risk analysts' debate and deliver the final trading decision.
-
-{instrument_context}
-
----
+        # Cache-friendly prompt layout (DeepSeek context caching is prefix-
+        # based): the role + rating scale stay in a static system message so
+        # the cached prefix hits across tickers and cycles. Dynamic data
+        # (instrument context, plans, lessons, debate history) goes into a
+        # user message.
+        system_prompt = f"""As the Portfolio Manager, synthesize the risk analysts' debate and deliver the final trading decision.
 
 **Rating Scale** (use exactly one):
 - **Buy**: Strong conviction to enter or add to position
@@ -53,6 +54,14 @@ def create_portfolio_manager(llm):
 - **Underweight**: Reduce exposure, take partial profits
 - **Sell**: Exit position or avoid entry
 
+Be decisive and ground every conclusion in specific evidence from the analysts.
+
+{NO_EXTERNAL_TOOLS}{get_language_instruction()}"""
+
+        user_prompt = f"""{instrument_context}
+
+---
+
 **Context:**
 - Research Manager's investment plan: **{research_plan}**
 - Trader's transaction proposal: **{trader_plan}**
@@ -60,16 +69,15 @@ def create_portfolio_manager(llm):
 **Risk Analysts Debate History:**
 {history}
 
----
-
-Be decisive and ground every conclusion in specific evidence from the analysts.
-
-{NO_EXTERNAL_TOOLS}{get_language_instruction()}"""
+Deliver the final trading decision."""
 
         final_trade_decision = invoke_structured_or_freetext(
             structured_llm,
             llm,
-            prompt,
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
             render_pm_decision,
             "Portfolio Manager",
         )

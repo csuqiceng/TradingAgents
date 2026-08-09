@@ -30,6 +30,11 @@ def create_news_analyst(llm):
             + get_language_instruction()
         )
 
+        # Cache-friendly prompt layout (DeepSeek context caching is prefix-
+        # based): the system message stays 100% static (same bytes every call),
+        # so the cached prefix hits across tickers and cycles. All dynamic data
+        # (date, instrument context) goes into a trailing user message, which
+        # does not disturb the system prefix.
         prompt = ChatPromptTemplate.from_messages(
             [
                 (
@@ -40,11 +45,14 @@ def create_news_analyst(llm):
                     " will help where you left off. Execute what you can to make progress."
                     " If you or any other assistant has the FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL** or deliverable,"
                     " prefix your response with FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL** so the team knows to stop."
-                    " You have access to the following tools: {tool_names}."
-                    " Today's date is {current_date}; treat it as 'now' for all analysis and tool-call date ranges. {instrument_context}\n"
+                    " You have access to the following tools: {tool_names}.\n"
                     "{system_message}",
                 ),
                 MessagesPlaceholder(variable_name="messages"),
+                (
+                    "human",
+                    "Today's date is {current_date}; treat it as 'now' for all analysis and tool-call date ranges. {instrument_context}\n\nProceed with your assigned analysis.",
+                ),
             ]
         )
 
